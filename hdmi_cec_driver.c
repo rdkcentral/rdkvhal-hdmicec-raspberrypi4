@@ -24,13 +24,13 @@
 HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 {
   (void)handle;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecClose(int handle)
 {
   (void)handle;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecSetLogicalAddress(int handle, int* logicalAddresses, int num)
@@ -38,35 +38,35 @@ HDMI_CEC_STATUS HdmiCecSetLogicalAddress(int handle, int* logicalAddresses, int 
   (void)handle;
   (void)logicalAddresses;
   (void)num;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddress)
 {
   (void)handle;
   (void)physicalAddress;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
   (void)handle;
   (void)logicalAddresses;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
   (void)handle;
   (void)logicalAddresses;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int* logicalAddress)
 {
   (void)handle;
   (void)logicalAddress;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t cbfunc, void* data)
@@ -74,7 +74,7 @@ HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t cbfunc, voi
   (void)handle;
   (void)cbfunc;
   (void)data;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, void* data)
@@ -82,7 +82,7 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, voi
   (void)handle;
   (void)cbfunc;
   (void)data;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* result)
@@ -91,7 +91,7 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
   (void)buf;
   (void)len;
   (void)result;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
@@ -99,5 +99,5 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
   (void)handle;
   (void)buf;
   (void)len;
-  return (int)0;
+  return HDMI_CEC_IO_SUCCESS;
 }
