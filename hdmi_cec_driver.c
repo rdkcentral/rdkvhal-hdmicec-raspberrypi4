@@ -50,7 +50,7 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 
 HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
-  if (handle == 0 || logicalAddresses < 0x0 || logicalAddresses > 0xF )
+  if (handle == 0 || logicalAddresses < 0 || logicalAddresses > 15)
   {
 	  return HDMI_CEC_IO_INVALID_ARGUMENT;
   }
@@ -59,7 +59,7 @@ HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
-  if (handle == 0 || logicalAddresses < 0x0 || logicalAddresses > 0xF)
+  if (handle == 0 || logicalAddresses < 0 || logicalAddresses > 15)
   {
     return HDMI_CEC_IO_INVALID_ARGUMENT;
   }
