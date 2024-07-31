@@ -23,81 +23,95 @@
 
 HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 {
-  (void)handle;
+  if (handle == NULL)
+  {
+	  return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecClose(int handle)
 {
-  (void)handle;
-  return HDMI_CEC_IO_SUCCESS;
-}
-
-HDMI_CEC_STATUS HdmiCecSetLogicalAddress(int handle, int* logicalAddresses, int num)
-{
-  (void)handle;
-  (void)logicalAddresses;
-  (void)num;
+  if (handle == 0)
+  {
+    return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddress)
 {
-  (void)handle;
-  (void)physicalAddress;
+  if (handle == 0 || physicalAddress == NULL)
+  {
+    return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
-  (void)handle;
-  (void)logicalAddresses;
+  if (handle == 0 || logicalAddresses < 0x0 || logicalAddresses > 0xF )
+  {
+	  return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
-  (void)handle;
-  (void)logicalAddresses;
+  if (handle == 0 || logicalAddresses < 0x0 || logicalAddresses > 0xF)
+  {
+    return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int* logicalAddress)
 {
-  (void)handle;
-  (void)logicalAddress;
+  if (handle == 0 || logicalAddress == NULL)
+  {
+    return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t cbfunc, void* data)
 {
-  (void)handle;
   (void)cbfunc;
   (void)data;
+  if (handle == 0)
+  {
+    return HDMI_CEC_IO_INVALID_HANDLE;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, void* data)
 {
-  (void)handle;
   (void)cbfunc;
   (void)data;
+  if (handle == 0)
+  {
+    return HDMI_CEC_IO_INVALID_HANDLE;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* result)
 {
-  (void)handle;
-  (void)buf;
-  (void)len;
-  (void)result;
+  if (handle == 0 || buf == NULL || len == 0 || result == NULL)
+  {
+    return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
+  *result = HDMI_CEC_IO_SENT_FAILED;
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 {
-  (void)handle;
-  (void)buf;
-  (void)len;
+  if (handle == 0 || buf == NULL || len == 0)
+  {
+    return HDMI_CEC_IO_INVALID_ARGUMENT;
+  }
   return HDMI_CEC_IO_SUCCESS;
 }
