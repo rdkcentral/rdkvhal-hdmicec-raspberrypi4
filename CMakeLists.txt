@@ -19,6 +19,14 @@ install(TARGETS ${LIBNAME}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
+# Create a symbolic link for the .so file
+install(CODE "execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink lib${LIBNAME}.so.${PROJECT_VERSION} lib${LIBNAME}.so)")
+
+# Install the symbolic link in the -dev package
+install(FILES ${CMAKE_BINARY_DIR}/lib${LIBNAME}.so
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
 # Define package configuration variables
 set(PACKAGE_NAME ${LIBNAME})
 set(PACKAGE_VERSION ${PROJECT_VERSION})
