@@ -1,30 +1,34 @@
 # Minimum CMake version required
 cmake_minimum_required(VERSION 3.10)
 
-project(RCECHal VERSION 1.0 LANGUAGES C)
+# Version is matched with the version of hdmicecheader - 1.3.7.
+project(RCECHal VERSION 1.3.7 LANGUAGES C)
 
 set(LIBNAME RCECHal)
 set(SRCS hdmi_cec_driver.c)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror -Wall -Wextra -fPIC")
+set(DEFAULT_BUILD_TYPE "Release")
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
+	set(CMAKE_BUILD_TYPE "${DEFAULT_BUILD_TYPE}" CACHE STRING "Choose the type of build." FORCE)
+	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
 
 include(GNUInstallDirs)
+
+set_target_properties(${LIBNAME} PROPERTIES
+	VERSION ${PROJECT_VERSION}
+	SOVERSION ${PROJECT_VERSION}
+)
 
 add_library(${LIBNAME} SHARED ${SRCS})
 
 add_custom_target(clean-all
-    COMMAND ${CMAKE_COMMAND} -P clean.cmake
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/clean.cmake
 )
 
 install(TARGETS ${LIBNAME}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-# Create a symbolic link for the .so file
-install(CODE "execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink lib${LIBNAME}.so.${PROJECT_VERSION} lib${LIBNAME}.so)")
-
-# Install the symbolic link in the -dev package
-install(FILES ${CMAKE_BINARY_DIR}/lib${LIBNAME}.so
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
 # Define package configuration variables
@@ -41,5 +45,5 @@ configure_file(
 )
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/RCECHal.pc
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/pkgconfig
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/pkgconfig
 )
