@@ -16,12 +16,12 @@ endif()
 
 include(GNUInstallDirs)
 
+add_library(${LIBNAME} SHARED ${SRCS})
+
 set_target_properties(${LIBNAME} PROPERTIES
 	VERSION ${PROJECT_VERSION}
 	SOVERSION ${PROJECT_VERSION}
 )
-
-add_library(${LIBNAME} SHARED ${SRCS})
 
 add_custom_target(clean-all
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/clean.cmake
