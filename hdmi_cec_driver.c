@@ -19,28 +19,44 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "ccec/drivers/hdmi_cec_driver.h"
 
+static bool _bhdmicecintialized = false;
 HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 {
+  if (_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_ALREADY_OPEN;
+  }
   if (handle == NULL)
   {
 	  return HDMI_CEC_IO_INVALID_ARGUMENT;
   }
+  _bhdmicecintialized = true
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecClose(int handle)
 {
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0)
   {
-    return HDMI_CEC_IO_INVALID_ARGUMENT;
+    return HDMI_CEC_IO_INVALID_HANDLE;
   }
+  _bhdmicecintialized = false;
   return HDMI_CEC_IO_SUCCESS;
 }
 
 HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddress)
 {
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0 || physicalAddress == NULL)
   {
     return HDMI_CEC_IO_INVALID_ARGUMENT;
@@ -79,6 +95,10 @@ HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t cbfunc, voi
 {
   (void)cbfunc;
   (void)data;
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0)
   {
     return HDMI_CEC_IO_INVALID_HANDLE;
@@ -90,6 +110,10 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, voi
 {
   (void)cbfunc;
   (void)data;
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0)
   {
     return HDMI_CEC_IO_INVALID_HANDLE;
