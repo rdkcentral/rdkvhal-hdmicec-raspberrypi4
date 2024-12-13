@@ -66,6 +66,10 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 
 HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0 || logicalAddresses < 0 || logicalAddresses > 15)
   {
 	  return HDMI_CEC_IO_INVALID_ARGUMENT;
@@ -75,6 +79,10 @@ HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0 || logicalAddresses < 0 || logicalAddresses > 15)
   {
     return HDMI_CEC_IO_INVALID_ARGUMENT;
@@ -84,6 +92,10 @@ HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 
 HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int* logicalAddress)
 {
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0 || logicalAddress == NULL)
   {
     return HDMI_CEC_IO_INVALID_ARGUMENT;
@@ -123,6 +135,10 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, voi
 
 HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* result)
 {
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0 || buf == NULL || len == 0 || result == NULL)
   {
     return HDMI_CEC_IO_INVALID_ARGUMENT;
@@ -133,6 +149,10 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 
 HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 {
+  if (!_bhdmicecintialized)
+  {
+  	return HDMI_CEC_IO_NOT_OPENED;
+  }
   if (handle == 0 || buf == NULL || len == 0)
   {
     return HDMI_CEC_IO_INVALID_ARGUMENT;
