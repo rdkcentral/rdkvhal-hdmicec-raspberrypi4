@@ -33,7 +33,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
   {
 	  return HDMI_CEC_IO_INVALID_ARGUMENT;
   }
-  _bhdmicecintialized = true
+  _bhdmicecintialized = true;
   return HDMI_CEC_IO_SUCCESS;
 }
 
