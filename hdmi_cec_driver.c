@@ -131,7 +131,7 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, voi
     {
         return HDMI_CEC_IO_INVALID_HANDLE;
     }
-    return HDMI_CEC_IO_SUCCESS;
+    return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
 }
 
 HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* result)
@@ -144,7 +144,6 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
     {
         return HDMI_CEC_IO_INVALID_ARGUMENT;
     }
-    //*result = HDMI_CEC_IO_SENT_FAILED;
     return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
 }
 
