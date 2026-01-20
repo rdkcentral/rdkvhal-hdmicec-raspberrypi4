@@ -99,6 +99,7 @@ typedef struct {
 	void *rx_callback_data;           /**< User data for RX callback */
 	HdmiCecTxCallback_t tx_callback;  /**< Registered TX callback function */
 	void *tx_callback_data;           /**< User data for TX callback */
+	unsigned int tx_callback_gen;     /**< TX callback generation counter for race prevention */
 	int logical_address;              /**< Current CEC logical address (0-15, 15=unregistered) */
 	unsigned int physical_address;    /**< Current CEC physical address (0x0000-0xFFFF) */
 	bool has_logical_address;         /**< True when valid logical address assigned */
@@ -274,11 +275,7 @@ static void cec_log_buffer(const char *prefix, const unsigned char *buf, int len
 		return;
 	}
 
-	// Skip mutex lock if logging is disabled (optimization)
-	if (g_log_file == NULL) {
-		return;
-	}
-
+	// Check if logging is enabled under mutex to avoid TOCTOU race
 	pthread_mutex_lock(&g_log_mutex);
 
 	if (g_log_file != NULL) {
@@ -366,6 +363,7 @@ static cec_context_t g_cec_context = {
 	.rx_callback_data = NULL,
 	.tx_callback = NULL,
 	.tx_callback_data = NULL,
+	.tx_callback_gen = 0,
 	.logical_address = RPI_CEC_UNREGISTERED_ADDR,
 	.physical_address = 0xFFFF,
 	.has_logical_address = false
@@ -485,7 +483,8 @@ static void *cec_rx_thread(void *arg)
 		// Reset error counter on successful receive
 		consecutive_errors = 0;
 
-		// Only process received messages (not transmit results)
+		// Only process received messages (not transmit status reports)
+		// Received messages have tx_status == 0; TX status reports have flags set
 		if (!(msg.tx_status & CEC_TX_STATUS_OK) &&
 			!(msg.tx_status & CEC_TX_STATUS_NACK) &&
 			!(msg.tx_status & CEC_TX_STATUS_ERROR)) {
@@ -710,10 +709,9 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 			if (join_result == 0) {
 				CEC_LOG_DEBUG("Thread joined successfully");
 			} else if (join_result == ETIMEDOUT) {
-				CEC_LOG_WARN("Thread join timeout, canceling thread");
-				// Thread didn't exit gracefully, cancel it
-				pthread_cancel(thread_to_join);
-				pthread_join(thread_to_join, NULL);
+				CEC_LOG_ERROR("Thread join timeout - thread may leak resources");
+				// Do NOT use pthread_cancel - it's unsafe and can cause deadlocks
+				// Thread will be abandoned; OS will clean up at process exit
 			} else if (join_result != ESRCH) {
 				CEC_LOG_WARN("Thread join failed: %d, using regular join", join_result);
 				// Fall back to regular join
@@ -738,6 +736,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	// Reset context
 	g_cec_context.initialized = false;
 	g_cec_context.handle = 0;
+	g_cec_context.rx_thread = 0;
 	g_cec_context.rx_callback = NULL;
 	g_cec_context.rx_callback_data = NULL;
 	g_cec_context.tx_callback = NULL;
@@ -779,6 +778,11 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 	}
 
 	g_cec_context.physical_address = cec_convert_physical_address(phys_addr);
+
+	// Warn if physical address is invalid (0xFFFF indicates not connected)
+	if (g_cec_context.physical_address == 0xFFFF) {
+		CEC_LOG_WARN("Physical address is 0xFFFF (invalid/not connected)");
+	}
 
 	*physicalAddress = g_cec_context.physical_address;
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -911,6 +915,7 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, voi
 
 	g_cec_context.tx_callback = cbfunc;
 	g_cec_context.tx_callback_data = data;
+	g_cec_context.tx_callback_gen++; // Invalidate any in-flight async callbacks
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 	return HDMI_CEC_IO_SUCCESS;
@@ -975,6 +980,7 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 		return HDMI_CEC_IO_SENT_FAILED;
 	}
 
+	// Note: If fd was closed during ioctl, ret will be negative (EBADF)
 	if (ret < 0) {
 		CEC_LOG_ERROR("ioctl(CEC_TRANSMIT) failed: %s", strerror(errno));
 		pthread_mutex_unlock(&g_cec_context.mutex);
@@ -1037,12 +1043,10 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	memcpy(msg.msg, buf, len);
 	msg.timeout = CEC_IOCTL_TIMEOUT_MS;
 
-	// Save callback references before releasing mutex
-	// Note: There's a small window where the callback could be changed by another thread
-	// after we save these references but before we invoke. This is acceptable as the
-	// old callback is what the caller expects for this transmission.
+	// Save callback references and generation counter to detect changes
 	callback = g_cec_context.tx_callback;
 	callback_data = g_cec_context.tx_callback_data;
+	unsigned int callback_gen = g_cec_context.tx_callback_gen;
 
 	// Send message (non-blocking mode already set on fd)
 	ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
@@ -1053,8 +1057,12 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 		return HDMI_CEC_IO_SENT_FAILED;
 	}
 
-	// Call tx callback if registered (using saved references)
-	if (callback) {
+	// Call tx callback if registered and not changed during transmission
+	pthread_mutex_lock(&g_cec_context.mutex);
+	bool callback_valid = (callback != NULL && g_cec_context.tx_callback_gen == callback_gen);
+	pthread_mutex_unlock(&g_cec_context.mutex);
+
+	if (callback_valid) {
 		int tx_result;
 		if (msg.tx_status & CEC_TX_STATUS_OK) {
 			tx_result = HDMI_CEC_IO_SENT_AND_ACKD;
@@ -1123,12 +1131,10 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		pthread_mutex_unlock(&g_cec_context.mutex);
 	}
 
-	// Close logging before destroying mutexes
+	// Close logging
 	cec_log_close();
 
-	// Destroy log mutex (assumes no other threads are logging)
-	pthread_mutex_destroy(&g_log_mutex);
-
-	// Destroy context mutex (safe now that thread is joined and device closed)
-	pthread_mutex_destroy(&g_cec_context.mutex);
+	// Note: We don't destroy statically initialized mutexes here.
+	// At process exit, the OS will clean up all resources.
+	// Destroying mutexes could cause issues if other code is still using them.
 }
