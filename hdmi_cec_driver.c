@@ -93,6 +93,7 @@ typedef struct {
 	int handle;                       /**< HAL handle returned to caller, 0 when invalid */
 	bool initialized;                 /**< True when HdmiCecOpen has succeeded */
 	bool running;                     /**< True when RX thread should be running */
+	bool thread_created;              /**< True when RX thread has been created */
 	pthread_t rx_thread;              /**< RX thread handle, 0 when not created */
 	pthread_mutex_t mutex;            /**< Protects all context fields */
 	HdmiCecRxCallback_t rx_callback;  /**< Registered RX callback function */
@@ -357,6 +358,7 @@ static cec_context_t g_cec_context = {
 	.handle = 0,
 	.initialized = false,
 	.running = false,
+	.thread_created = false,
 	.rx_thread = 0,
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.rx_callback = NULL,
@@ -485,6 +487,8 @@ static void *cec_rx_thread(void *arg)
 
 		// Only process received messages (not transmit status reports)
 		// Received messages have tx_status == 0; TX status reports have flags set
+		// Note: This filters based on the kernel's message tagging. The kernel sets
+		// tx_status flags only for messages that are TX completions, not for received messages.
 		if (!(msg.tx_status & CEC_TX_STATUS_OK) &&
 			!(msg.tx_status & CEC_TX_STATUS_NACK) &&
 			!(msg.tx_status & CEC_TX_STATUS_ERROR)) {
@@ -673,6 +677,11 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	ret = pthread_create(&g_cec_context.rx_thread, NULL, cec_rx_thread, &g_cec_context);
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to create RX thread: %s", strerror(ret));
+
+		// Clean up CEC configuration before closing
+		memset(&log_addrs, 0, sizeof(log_addrs));
+		(void)ioctl(g_cec_context.fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs);
+
 		close(g_cec_context.fd);
 		g_cec_context.fd = -1;
 		g_cec_context.initialized = false;
@@ -680,6 +689,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
+	g_cec_context.thread_created = true;
 
 	*handle = g_cec_context.handle;
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -751,6 +761,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	g_cec_context.initialized = false;
 	g_cec_context.handle = 0;
 	g_cec_context.rx_thread = 0;
+	g_cec_context.thread_created = false;
 	g_cec_context.rx_callback = NULL;
 	g_cec_context.rx_callback_data = NULL;
 	g_cec_context.tx_callback = NULL;
@@ -983,6 +994,8 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	// Send message synchronously (release mutex to avoid blocking other threads)
+	// Note: If HdmiCecClose is called now, cec_fd may be closed. The ioctl will
+	// return EBADF which is handled below as SENT_FAILED.
 	ret = ioctl(cec_fd, CEC_TRANSMIT, &msg);
 
 	// Reacquire mutex and revalidate state
@@ -1061,6 +1074,7 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	callback = g_cec_context.tx_callback;
 	callback_data = g_cec_context.tx_callback_data;
 	unsigned int callback_gen = g_cec_context.tx_callback_gen;
+	int saved_handle = handle; // Save handle from parameter for callback consistency
 
 	// Send message (non-blocking mode already set on fd)
 	ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
@@ -1087,7 +1101,7 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 		} else {
 			tx_result = HDMI_CEC_IO_SENT_FAILED;
 		}
-		callback(handle, callback_data, tx_result);
+		callback(saved_handle, callback_data, tx_result);
 	}
 
 	return HDMI_CEC_IO_SUCCESS;
@@ -1112,13 +1126,14 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 	if (g_cec_context.initialized) {
 		CEC_LOG_WARN("CEC device still open during shutdown, forcing cleanup");
 		g_cec_context.running = false;
+		bool thread_was_created = g_cec_context.thread_created;
 		pthread_t thread_to_join = g_cec_context.rx_thread;
 		int fd_to_close = g_cec_context.fd;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 
 		// Wait for RX thread to exit gracefully (do NOT use pthread_cancel)
 		// The thread will exit when it sees running = false
-		if (thread_to_join) {
+		if (thread_was_created) {
 			struct timespec timeout_ts;
 			if (clock_gettime(CLOCK_REALTIME, &timeout_ts) == 0) {
 				timeout_ts.tv_sec += 2; // 2 second timeout
@@ -1142,6 +1157,7 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		g_cec_context.initialized = false;
 		g_cec_context.fd = -1;
 		g_cec_context.rx_thread = 0;
+		g_cec_context.thread_created = false;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 	} else {
 		pthread_mutex_unlock(&g_cec_context.mutex);
