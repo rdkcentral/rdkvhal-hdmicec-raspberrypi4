@@ -627,11 +627,21 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		}
 		if (log_addrs.num_log_addrs > 0) {
 			g_cec_context.logical_address = cec_convert_logical_address(log_addrs.log_addr[0]);
-			g_cec_context.has_logical_address = true;
-			CEC_LOG_INFO("Logical address assigned: %d, Physical address: 0x%04x",
-						g_cec_context.logical_address, g_cec_context.physical_address);
+
+			// Check if logical address is valid (0-14) or unregistered (15/255)
+			if (g_cec_context.logical_address == CEC_LOG_ADDR_UNREGISTERED ||
+			    g_cec_context.logical_address > 15) {
+				CEC_LOG_ERROR("Invalid logical address: %d (0x%02X) - CEC discovery failed",
+							 g_cec_context.logical_address, g_cec_context.logical_address);
+				CEC_LOG_ERROR("Possible causes: No CEC-enabled display connected, CEC disabled on TV, or HDMI cable doesn't support CEC");
+				g_cec_context.has_logical_address = false;
+			} else {
+				g_cec_context.has_logical_address = true;
+				CEC_LOG_INFO("Logical address assigned: %d, Physical address: 0x%04x",
+							g_cec_context.logical_address, g_cec_context.physical_address);
+			}
 		} else {
-			CEC_LOG_WARN("No logical address assigned");
+			CEC_LOG_WARN("No logical address assigned - CEC will not work");
 		}
 	} else {
 		CEC_LOG_ERROR("Failed to get logical addresses: %s", strerror(errno));
