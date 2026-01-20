@@ -16,7 +16,47 @@ endif()
 
 include(GNUInstallDirs)
 
+# Get git commit SHA
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+if(NOT GIT_COMMIT_SHA)
+    set(GIT_COMMIT_SHA "unknown")
+endif()
+
+message(STATUS "Git commit SHA: ${GIT_COMMIT_SHA}")
+
+# Find the HDMI CEC HAL interface header
+find_path(HDMI_CEC_INCLUDE_DIR hdmi_cec_driver.h
+    PATHS
+        ${CMAKE_CURRENT_SOURCE_DIR}/../rdk-halif-hdmi_cec/include
+        /usr/include
+        /usr/local/include
+    PATH_SUFFIXES ccec/drivers
+)
+
+if(NOT HDMI_CEC_INCLUDE_DIR)
+    message(STATUS "HDMI CEC header not found in system paths, using local path")
+    set(HDMI_CEC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../rdk-halif-hdmi_cec/include)
+endif()
+
 add_library(${LIBNAME} SHARED ${SRCS})
+
+target_include_directories(${LIBNAME} PRIVATE ${HDMI_CEC_INCLUDE_DIR})
+
+# Define version information as compile definitions
+target_compile_definitions(${LIBNAME} PRIVATE
+    HAL_VERSION="${PROJECT_VERSION}"
+    GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
+)
+
+# Link pthread library
+target_link_libraries(${LIBNAME} PRIVATE pthread)
 
 set_target_properties(${LIBNAME} PROPERTIES
 	VERSION ${PROJECT_VERSION}
