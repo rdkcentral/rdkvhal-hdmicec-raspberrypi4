@@ -17,6 +17,7 @@
  * limitations under the License.
  */
 
+#define _GNU_SOURCE
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -523,7 +524,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 {
 	struct cec_caps caps;
 	struct cec_log_addrs log_addrs;
-	struct cec_mode_follower mode_follower;
+	__u32 mode;
 	int ret;
 
 	CEC_LOG_INFO("%s", __func__);
@@ -617,7 +618,14 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	// Get the assigned logical address and physical address
 	memset(&log_addrs, 0, sizeof(log_addrs));
 	if (ioctl(g_cec_context.fd, CEC_ADAP_G_LOG_ADDRS, &log_addrs) == 0) {
-		g_cec_context.physical_address = cec_convert_physical_address(log_addrs.phys_addr);
+		// Get physical address using separate ioctl (older CEC API compatibility)
+		__u16 phys_addr = 0;
+		if (ioctl(g_cec_context.fd, CEC_ADAP_G_PHYS_ADDR, &phys_addr) == 0) {
+			g_cec_context.physical_address = cec_convert_physical_address(phys_addr);
+		} else {
+			CEC_LOG_WARN("Failed to get physical address: %s", strerror(errno));
+			g_cec_context.physical_address = 0xFFFF;
+		}
 		if (log_addrs.num_log_addrs > 0) {
 			g_cec_context.logical_address = cec_convert_logical_address(log_addrs.log_addr[0]);
 			g_cec_context.has_logical_address = true;
@@ -632,9 +640,8 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 
 	// Set mode to allow receive and transmit
 	CEC_LOG_DEBUG("Setting CEC mode: INITIATOR | FOLLOWER");
-	memset(&mode_follower, 0, sizeof(mode_follower));
-	mode_follower.mode = CEC_MODE_INITIATOR | CEC_MODE_FOLLOWER;
-	if (ioctl(g_cec_context.fd, CEC_S_MODE, &mode_follower) < 0) {
+	mode = CEC_MODE_INITIATOR | CEC_MODE_FOLLOWER;
+	if (ioctl(g_cec_context.fd, CEC_S_MODE, &mode) < 0) {
 		CEC_LOG_ERROR("Failed to set CEC mode: %s", strerror(errno));
 		close(g_cec_context.fd);
 		g_cec_context.fd = -1;
@@ -746,7 +753,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 
 HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddress)
 {
-	struct cec_log_addrs log_addrs;
+	__u16 phys_addr;
 
 	pthread_mutex_lock(&g_cec_context.mutex);
 
@@ -765,14 +772,13 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
-	// Get current physical address from driver
-	memset(&log_addrs, 0, sizeof(log_addrs));
-	if (ioctl(g_cec_context.fd, CEC_ADAP_G_LOG_ADDRS, &log_addrs) < 0) {
+	// Get current physical address from driver (older CEC API compatibility)
+	if (ioctl(g_cec_context.fd, CEC_ADAP_G_PHYS_ADDR, &phys_addr) < 0) {
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
-	g_cec_context.physical_address = cec_convert_physical_address(log_addrs.phys_addr);
+	g_cec_context.physical_address = cec_convert_physical_address(phys_addr);
 
 	*physicalAddress = g_cec_context.physical_address;
 	pthread_mutex_unlock(&g_cec_context.mutex);
