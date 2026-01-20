@@ -554,11 +554,15 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 			CEC_LOG_ERROR("CEC device not found - CEC not supported on this system");
 			CEC_LOG_ERROR("Hint: Check if dtoverlay=vc4-kms-v3d is enabled in /boot/config.txt");
 			pthread_mutex_unlock(&g_cec_context.mutex);
+			// Brief delay to avoid tight retry loops in caller.
+			usleep(ERROR_RECOVERY_DELAY_MS * 1000);
 			return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
 		}
 
 		// Other errors (permissions, device busy, etc.)
 		pthread_mutex_unlock(&g_cec_context.mutex);
+		// Brief delay to avoid tight retry loops in caller.
+		usleep(ERROR_RECOVERY_DELAY_MS * 1000);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 	CEC_LOG_INFO("CEC device opened: %s, fd=%d", CEC_DEVICE_PATH, g_cec_context.fd);
@@ -1064,6 +1068,8 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (ret < 0) {
+		CEC_LOG_ERROR("ioctl(CEC_TRANSMIT) failed: %s", strerror(errno));
+		usleep(ERROR_RECOVERY_DELAY_MS * 1000);
 		return HDMI_CEC_IO_SENT_FAILED;
 	}
 
@@ -1143,7 +1149,6 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 
 	// Close logging
 	cec_log_close();
-
 	// Note: We don't destroy statically initialized mutexes here.
 	// At process exit, the OS will clean up all resources.
 	// Destroying mutexes could cause issues if other code is still using them.
