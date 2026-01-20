@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -57,20 +58,20 @@
 #define RPI_CEC_OSD_NAME "Raspberry Pi"
 #define RPI_CEC_UNREGISTERED_ADDR 0x0F
 
-// Log levels
-#define CEC_LOG_ERROR   0
-#define CEC_LOG_WARN	1
-#define CEC_LOG_INFO	2
-#define CEC_LOG_DEBUG   3
-#define CEC_LOG_TRACE   4
+// Log levels (numeric constants)
+#define CEC_LOG_LEVEL_ERROR   0
+#define CEC_LOG_LEVEL_WARN    1
+#define CEC_LOG_LEVEL_INFO    2
+#define CEC_LOG_LEVEL_DEBUG   3
+#define CEC_LOG_LEVEL_TRACE   4
 
 // Logging macros - controlled by environment variables CEC_HAL_LOG_LEVEL and CEC_HAL_LOG_FILE
 #define CEC_LOG(level, ...) cec_log(level, __func__, __LINE__, __VA_ARGS__)
-#define CEC_LOG_ERROR(...) CEC_LOG(CEC_LOG_ERROR, __VA_ARGS__)
-#define CEC_LOG_WARN(...)  CEC_LOG(CEC_LOG_WARN, __VA_ARGS__)
-#define CEC_LOG_INFO(...)  CEC_LOG(CEC_LOG_INFO, __VA_ARGS__)
-#define CEC_LOG_DEBUG(...) CEC_LOG(CEC_LOG_DEBUG, __VA_ARGS__)
-#define CEC_LOG_TRACE(...) CEC_LOG(CEC_LOG_TRACE, __VA_ARGS__)
+#define CEC_LOG_ERROR(...) CEC_LOG(CEC_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define CEC_LOG_WARN(...)  CEC_LOG(CEC_LOG_LEVEL_WARN, __VA_ARGS__)
+#define CEC_LOG_INFO(...)  CEC_LOG(CEC_LOG_LEVEL_INFO, __VA_ARGS__)
+#define CEC_LOG_DEBUG(...) CEC_LOG(CEC_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#define CEC_LOG_TRACE(...) CEC_LOG(CEC_LOG_LEVEL_TRACE, __VA_ARGS__)
 #define CEC_LOG_BUFFER(prefix, buf, len) cec_log_buffer(prefix, buf, len)
 
 /**
@@ -106,7 +107,7 @@ static FILE *g_log_file = NULL;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Default log level
-static int g_log_level = CEC_LOG_ERROR;
+static int g_log_level = CEC_LOG_LEVEL_ERROR;
 
 // Current timestamp
 static void cec_get_timestamp(char *buffer, size_t size)
@@ -140,11 +141,11 @@ static void cec_get_timestamp(char *buffer, size_t size)
 static const char* cec_get_log_level_str(int level)
 {
 	switch(level) {
-		case CEC_LOG_ERROR: return "ERROR";
-		case CEC_LOG_WARN:  return "WARN ";
-		case CEC_LOG_INFO:  return "INFO ";
-		case CEC_LOG_DEBUG: return "DEBUG";
-		case CEC_LOG_TRACE: return "TRACE";
+		case CEC_LOG_LEVEL_ERROR: return "ERROR";
+		case CEC_LOG_LEVEL_WARN:  return "WARN ";
+		case CEC_LOG_LEVEL_INFO:  return "INFO ";
+		case CEC_LOG_LEVEL_DEBUG: return "DEBUG";
+		case CEC_LOG_LEVEL_TRACE: return "TRACE";
 		default: return "UNKNOWN";
 	}
 }
@@ -169,15 +170,15 @@ static void cec_log_init(void)
 		// Read log level from environment variable
 		if (log_level_env != NULL) {
 			if (strcmp(log_level_env, "ERROR") == 0) {
-				g_log_level = CEC_LOG_ERROR;
+				g_log_level = CEC_LOG_LEVEL_ERROR;
 			} else if (strcmp(log_level_env, "WARN") == 0) {
-				g_log_level = CEC_LOG_WARN;
+				g_log_level = CEC_LOG_LEVEL_WARN;
 			} else if (strcmp(log_level_env, "INFO") == 0) {
-				g_log_level = CEC_LOG_INFO;
+				g_log_level = CEC_LOG_LEVEL_INFO;
 			} else if (strcmp(log_level_env, "DEBUG") == 0) {
-				g_log_level = CEC_LOG_DEBUG;
+				g_log_level = CEC_LOG_LEVEL_DEBUG;
 			} else if (strcmp(log_level_env, "TRACE") == 0) {
-				g_log_level = CEC_LOG_TRACE;
+				g_log_level = CEC_LOG_LEVEL_TRACE;
 			}
 		}
 
@@ -268,7 +269,7 @@ static void cec_log(int level, const char *func, int line, const char *format, .
 // Log buffer contents in hex
 static void cec_log_buffer(const char *prefix, const unsigned char *buf, int len)
 {
-	if (CEC_LOG_DEBUG > g_log_level || buf == NULL || len <= 0) {
+	if (CEC_LOG_LEVEL_DEBUG > g_log_level || buf == NULL || len <= 0) {
 		return;
 	}
 
