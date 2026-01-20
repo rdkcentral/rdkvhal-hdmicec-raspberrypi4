@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/types.h>
 #include <sys/ioctl.h>
 #include <pthread.h>
 #include <linux/cec.h>
@@ -73,20 +74,33 @@
 #define CEC_LOG_TRACE(...) CEC_LOG(CEC_LOG_TRACE, __VA_ARGS__)
 #define CEC_LOG_BUFFER(prefix, buf, len) cec_log_buffer(prefix, buf, len)
 
+/**
+ * @brief CEC driver context structure
+ *
+ * This structure maintains the runtime state of the HDMI CEC HAL driver.
+ * All fields are protected by the mutex except where noted.
+ *
+ * Threading: The rx_thread runs continuously when initialized is true and
+ * running is true. The mutex must be held when accessing most fields except
+ * during carefully controlled thread shutdown sequences.
+ *
+ * Lifetime: Initialized in cec_driver_init() constructor, used during
+ * HdmiCecOpen/Close operations, cleaned up in cec_driver_fini() destructor.
+ */
 typedef struct {
-	int fd;
-	int handle;
-	bool initialized;
-	bool running;
-	pthread_t rx_thread;
-	pthread_mutex_t mutex;
-	HdmiCecRxCallback_t rx_callback;
-	void *rx_callback_data;
-	HdmiCecTxCallback_t tx_callback;
-	void *tx_callback_data;
-	int logical_address;
-	unsigned int physical_address;
-	bool has_logical_address;
+	int fd;                           /**< File descriptor for /dev/cec0, -1 when closed */
+	int handle;                       /**< HAL handle returned to caller, 0 when invalid */
+	bool initialized;                 /**< True when HdmiCecOpen has succeeded */
+	bool running;                     /**< True when RX thread should be running */
+	pthread_t rx_thread;              /**< RX thread handle, 0 when not created */
+	pthread_mutex_t mutex;            /**< Protects all context fields */
+	HdmiCecRxCallback_t rx_callback;  /**< Registered RX callback function */
+	void *rx_callback_data;           /**< User data for RX callback */
+	HdmiCecTxCallback_t tx_callback;  /**< Registered TX callback function */
+	void *tx_callback_data;           /**< User data for TX callback */
+	int logical_address;              /**< Current CEC logical address (0-15, 15=unregistered) */
+	unsigned int physical_address;    /**< Current CEC physical address (0x0000-0xFFFF) */
+	bool has_logical_address;         /**< True when valid logical address assigned */
 } cec_context_t;
 
 static FILE *g_log_file = NULL;
@@ -297,11 +311,14 @@ static inline unsigned int cec_convert_physical_address(__u16 cec_phys_addr)
 	return (unsigned int)cec_phys_addr;
 }
 
+// Global CEC context - mutex initialized statically for thread safety
 static cec_context_t g_cec_context = {
 	.fd = -1,
 	.handle = 0,
 	.initialized = false,
 	.running = false,
+	.rx_thread = 0,
+	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.rx_callback = NULL,
 	.rx_callback_data = NULL,
 	.tx_callback = NULL,
@@ -310,8 +327,6 @@ static cec_context_t g_cec_context = {
 	.physical_address = 0xFFFF,
 	.has_logical_address = false
 };
-
-static void *cec_rx_thread(void *arg);
 
 static void *cec_rx_thread(void *arg)
 {
@@ -496,16 +511,6 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	}
 	CEC_LOG_INFO("CEC device opened: %s, fd=%d", CEC_DEVICE_PATH, g_cec_context.fd);
 
-	// Set receive timeout to prevent blocking indefinitely
-	struct timeval tv;
-	tv.tv_sec = 0;
-	tv.tv_usec = RX_POLL_TIMEOUT_MS * 1000;
-	if (setsockopt(g_cec_context.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-		CEC_LOG_WARN("Failed to set socket timeout: %s", strerror(errno));
-	} else {
-		CEC_LOG_DEBUG("Socket timeout set: %d ms", RX_POLL_TIMEOUT_MS);
-	}
-
 	// Get capabilities
 	memset(&caps, 0, sizeof(caps));
 	if (ioctl(g_cec_context.fd, CEC_ADAP_G_CAPS, &caps) < 0) {
@@ -633,34 +638,34 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	// Stop receive thread
 	CEC_LOG_DEBUG("Stopping RX thread");
 	g_cec_context.running = false;
+	pthread_t thread_to_join = g_cec_context.rx_thread;
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
-	// Wait for thread to finish with timeout
-	if (g_cec_context.rx_thread) {
+	// Wait for thread to finish with timeout (Note: pthread_timedjoin_np is GNU/Linux specific)
+	if (thread_to_join) {
 		struct timespec ts;
 		int join_result;
 
 		if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
 			ts.tv_sec += THREAD_JOIN_TIMEOUT_SEC;
-			join_result = pthread_timedjoin_np(g_cec_context.rx_thread, NULL, &ts);
-			if (join_result == ETIMEDOUT) {
+			join_result = pthread_timedjoin_np(thread_to_join, NULL, &ts);
+			if (join_result == 0) {
+				CEC_LOG_DEBUG("Thread joined successfully");
+			} else if (join_result == ETIMEDOUT) {
 				CEC_LOG_WARN("Thread join timeout, canceling thread");
 				// Thread didn't exit gracefully, cancel it
-				pthread_cancel(g_cec_context.rx_thread);
-				pthread_join(g_cec_context.rx_thread, NULL);
-			} else if (join_result != 0 && join_result != ESRCH) {
+				pthread_cancel(thread_to_join);
+				pthread_join(thread_to_join, NULL);
+			} else if (join_result != ESRCH) {
 				CEC_LOG_WARN("Thread join failed: %d, using regular join", join_result);
 				// Fall back to regular join
-				pthread_join(g_cec_context.rx_thread, NULL);
-			} else {
-				CEC_LOG_DEBUG("Thread joined successfully");
+				pthread_join(thread_to_join, NULL);
 			}
 		} else {
 			CEC_LOG_WARN("clock_gettime failed, using regular join");
 			// clock_gettime failed, use regular join
-			pthread_join(g_cec_context.rx_thread, NULL);
+			pthread_join(thread_to_join, NULL);
 		}
-		g_cec_context.rx_thread = 0;
 	}
 
 	pthread_mutex_lock(&g_cec_context.mutex);
@@ -997,18 +1002,47 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	return HDMI_CEC_IO_SUCCESS;
 }
 
-// Initialize mutex at startup
+// Initialize logging at startup (mutex already initialized statically)
 static void __attribute__((constructor)) cec_driver_init(void)
 {
-	pthread_mutex_init(&g_cec_context.mutex, NULL);
 	cec_log_init();
 	CEC_LOG_INFO("RPi4 CEC HAL - Version: %s, Git SHA: %s", HAL_VERSION, GIT_COMMIT_SHA);
 }
 
-// Cleanup mutex at shutdown
+// Cleanup at shutdown - ensure resources are released even if HdmiCecClose not called
 static void __attribute__((destructor)) cec_driver_fini(void)
 {
 	CEC_LOG_INFO("RPi4 CEC HAL driver cleanup");
+
+	// Check if CEC device is still open and clean up
+	pthread_mutex_lock(&g_cec_context.mutex);
+	if (g_cec_context.initialized) {
+		CEC_LOG_WARN("CEC device still open during shutdown, forcing cleanup");
+		g_cec_context.running = false;
+		pthread_t thread_to_join = g_cec_context.rx_thread;
+		int fd_to_close = g_cec_context.fd;
+		pthread_mutex_unlock(&g_cec_context.mutex);
+
+		// Stop RX thread if running
+		if (thread_to_join) {
+			pthread_cancel(thread_to_join);
+			pthread_join(thread_to_join, NULL);
+		}
+
+		// Close device file descriptor
+		if (fd_to_close >= 0) {
+			close(fd_to_close);
+		}
+
+		pthread_mutex_lock(&g_cec_context.mutex);
+		g_cec_context.initialized = false;
+		g_cec_context.fd = -1;
+		g_cec_context.rx_thread = 0;
+		pthread_mutex_unlock(&g_cec_context.mutex);
+	} else {
+		pthread_mutex_unlock(&g_cec_context.mutex);
+	}
+
 	cec_log_close();
 	pthread_mutex_destroy(&g_cec_context.mutex);
 }
