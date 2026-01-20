@@ -732,8 +732,6 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 
 HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
-	struct cec_log_addrs log_addrs;
-
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -751,44 +749,18 @@ HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
-	// Get current logical address configuration
-	memset(&log_addrs, 0, sizeof(log_addrs));
-	if (ioctl(g_cec_context.fd, CEC_ADAP_G_LOG_ADDRS, &log_addrs) < 0) {
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_GENERAL_ERROR;
-	}
-
-	// Configure logical address (for sink devices or manual override)
-	// Note: For source devices, this should typically not be called as
-	// logical address is discovered during HdmiCecOpen()
-	log_addrs.cec_version = CEC_OP_CEC_VERSION_1_4;
-	log_addrs.num_log_addrs = 1;
-	log_addrs.log_addr[0] = logicalAddresses;
-	log_addrs.log_addr_type[0] = CEC_LOG_ADDR_TYPE_SPECIFIC;
-	log_addrs.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_PLAYBACK;
-	log_addrs.all_device_types[0] = CEC_OP_ALL_DEVTYPE_PLAYBACK;
-	log_addrs.vendor_id = RPI_CEC_VENDOR_ID;
-	strncpy(log_addrs.osd_name, RPI_CEC_OSD_NAME, sizeof(log_addrs.osd_name));
-	log_addrs.osd_name[sizeof(log_addrs.osd_name) - 1] = '\0';
-	log_addrs.features[0][0] = 0x00;
-
-	// Set logical address
-	if (ioctl(g_cec_context.fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
-	}
-
-	g_cec_context.logical_address = logicalAddresses;
-	g_cec_context.has_logical_address = true;
-
 	pthread_mutex_unlock(&g_cec_context.mutex);
-	return HDMI_CEC_IO_SUCCESS;
+
+	// This API is only supported for sink devices.
+	// Source devices get their logical address automatically during HdmiCecOpen()
+	// Per HAL test suite requirements, source devices must return OPERATION_NOT_SUPPORTED.
+	CEC_LOG_INFO("HdmiCecAddLogicalAddress not supported for source devices (Raspberry Pi 4)");
+	return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
+
 }
 
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
-	struct cec_log_addrs log_addrs;
-
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -811,20 +783,14 @@ HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 		return HDMI_CEC_IO_NOT_ADDED;
 	}
 
-	// Clear logical addresses
-	memset(&log_addrs, 0, sizeof(log_addrs));
-	log_addrs.num_log_addrs = 0;
-
-	if (ioctl(g_cec_context.fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_GENERAL_ERROR;
-	}
-
-	g_cec_context.logical_address = RPI_CEC_UNREGISTERED_ADDR;
-	g_cec_context.has_logical_address = false;
-
 	pthread_mutex_unlock(&g_cec_context.mutex);
-	return HDMI_CEC_IO_SUCCESS;
+
+	// This API is only supported for sink devices.
+	// Source devices get their logical address automatically during HdmiCecOpen()
+	// and cannot manually remove it.
+	// Per HAL test suite requirements, source devices must return OPERATION_NOT_SUPPORTED.
+	CEC_LOG_INFO("HdmiCecRemoveLogicalAddress not supported for source devices (Raspberry Pi 4)");
+	return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
 }
 
 HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int* logicalAddress)
