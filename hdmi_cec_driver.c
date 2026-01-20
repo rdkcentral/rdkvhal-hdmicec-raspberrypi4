@@ -311,6 +311,48 @@ static inline unsigned int cec_convert_physical_address(__u16 cec_phys_addr)
 	return (unsigned int)cec_phys_addr;
 }
 
+// Generate a secure random handle value (non-zero)
+static int cec_generate_handle(void)
+{
+	int handle = 0;
+	int urandom_fd;
+
+	// Try to read from /dev/urandom for cryptographically secure random number
+	urandom_fd = open("/dev/urandom", O_RDONLY);
+	if (urandom_fd >= 0) {
+		if (read(urandom_fd, &handle, sizeof(handle)) == sizeof(handle)) {
+			close(urandom_fd);
+			// Ensure handle is positive and non-zero
+			handle = (handle & 0x7FFFFFFF);
+			if (handle == 0) {
+				handle = 1;
+			}
+			return handle;
+		}
+		close(urandom_fd);
+	}
+
+	// Fallback: use time-based randomization if /dev/urandom fails
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+		// Combine seconds, nanoseconds, and process ID for uniqueness
+		handle = (int)((ts.tv_sec ^ ts.tv_nsec ^ getpid()) & 0x7FFFFFFF);
+		if (handle == 0) {
+			handle = (int)(ts.tv_nsec & 0x7FFFFFFF);
+		}
+	}
+
+	// Last resort: use current time
+	if (handle == 0) {
+		handle = (int)(time(NULL) & 0x7FFFFFFF);
+		if (handle == 0) {
+			handle = 1; // Absolute fallback
+		}
+	}
+
+	return handle;
+}
+
 // Global CEC context - mutex initialized statically for thread safety
 static cec_context_t g_cec_context = {
 	.fd = -1,
@@ -591,8 +633,8 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
-	// Initialize context
-	g_cec_context.handle = 1; // Non-zero handle
+	// Initialize context with dynamically generated handle for security
+	g_cec_context.handle = cec_generate_handle();
 	g_cec_context.initialized = true;
 	g_cec_context.running = true;
 	// logical_address and has_logical_address already set above
