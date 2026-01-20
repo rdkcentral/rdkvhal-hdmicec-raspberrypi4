@@ -36,9 +36,16 @@
 #include <stdarg.h>
 #include "hdmi_cec_driver.h"
 
+// Fallback version info if not provided by build system
+#ifndef HAL_VERSION
+#define HAL_VERSION "unknown"
+#endif
+#ifndef GIT_COMMIT_SHA
+#define GIT_COMMIT_SHA "unknown"
+#endif
+
 #define CEC_DEVICE_PATH "/dev/cec0"
 #define CEC_MAX_MSG_SIZE 16
-#define INVALID_HANDLE -1
 #define RX_POLL_TIMEOUT_MS 100
 #define MAX_CONSECUTIVE_ERRORS 10
 #define ERROR_RECOVERY_DELAY_MS 100
@@ -188,10 +195,14 @@ static void cec_log_init(void)
 		// Read log file path from environment variable (default to CEC_LOG_FILE_DEFAULT)
 		const char *log_file_path = log_file_env ? log_file_env : CEC_LOG_FILE_DEFAULT;
 
-		// Create directory if it doesn't exist (ignore error if already exists)
+		// Create directory if it doesn't exist
 		struct stat st;
 		if (stat(CEC_LOG_DIR, &st) != 0) {
-			(void)mkdir(CEC_LOG_DIR, 0755);
+			if (errno == ENOENT) {
+				if (mkdir(CEC_LOG_DIR, 0755) != 0 && errno != EEXIST) {
+					// Log directory creation failed, will try to create log file anyway
+				}
+			}
 		}
 
 		g_log_file = fopen(log_file_path, "a");
@@ -423,6 +434,16 @@ static void *cec_rx_thread(void *arg)
 				CEC_LOG_TRACE("poll() interrupted by signal");
 				continue;
 			}
+			if (errno == EBADF) {
+				// Device was closed - check if shutdown is in progress
+				pthread_mutex_lock(&ctx->mutex);
+				bool is_closing = !ctx->running;
+				pthread_mutex_unlock(&ctx->mutex);
+				if (is_closing) {
+					CEC_LOG_INFO("Device closed during poll, exiting thread");
+					break;
+				}
+			}
 			// Poll error - increment error counter
 			CEC_LOG_ERROR("poll() error: %s (errno=%d)", strerror(errno), errno);
 			consecutive_errors++;
@@ -471,6 +492,16 @@ static void *cec_rx_thread(void *arg)
 				CEC_LOG_TRACE("ioctl(CEC_RECEIVE) interrupted");
 				continue;
 			}
+			if (errno == EBADF) {
+				// Device was closed - check if shutdown is in progress
+				pthread_mutex_lock(&ctx->mutex);
+				bool is_closing = !ctx->running;
+				pthread_mutex_unlock(&ctx->mutex);
+				if (is_closing) {
+					CEC_LOG_INFO("Device closed during receive, exiting thread");
+					break;
+				}
+			}
 			// Critical error
 			CEC_LOG_ERROR("ioctl(CEC_RECEIVE) error: %s (errno=%d)", strerror(errno), errno);
 			consecutive_errors++;
@@ -501,16 +532,20 @@ static void *cec_rx_thread(void *arg)
 				CEC_LOG_INFO("Received CEC message: len=%d", len);
 				CEC_LOG_BUFFER("RX", buf, len);
 
-				// Call receive callback if registered - with validation
+				// Copy callback references under mutex protection, then invoke outside mutex
 				pthread_mutex_lock(&ctx->mutex);
-				if (ctx->running && ctx->initialized && ctx->rx_callback) {
-					CEC_LOG_DEBUG("Calling RX callback");
-					ctx->rx_callback(ctx->handle, ctx->rx_callback_data, buf, len);
-				} else {
-					CEC_LOG_WARN("RX callback not called: running=%d, init=%d, callback=%p",
-								ctx->running, ctx->initialized, (void*)ctx->rx_callback);
-				}
+				HdmiCecRxCallback_t rx_callback = ctx->rx_callback;
+				void *rx_callback_data = ctx->rx_callback_data;
+				int callback_handle = ctx->handle;
+				bool should_call = ctx->running && ctx->initialized && rx_callback != NULL;
 				pthread_mutex_unlock(&ctx->mutex);
+
+				if (should_call) {
+					CEC_LOG_DEBUG("Calling RX callback");
+					rx_callback(callback_handle, rx_callback_data, buf, len);
+				} else {
+					CEC_LOG_WARN("RX callback not called: running/init/callback validation failed");
+				}
 			} else {
 				CEC_LOG_WARN("Invalid message length: %d", len);
 			}
@@ -636,8 +671,10 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		if (log_addrs.num_log_addrs > 0) {
 			g_cec_context.logical_address = cec_convert_logical_address(log_addrs.log_addr[0]);
 
-			// Check if logical address is valid (0-14) or unregistered (15/255)
+			// Check if logical address is valid (0-14) or unregistered (15)
+			// CEC_LOG_ADDR_UNREGISTERED is typically 0x0F (15)
 			if (g_cec_context.logical_address == CEC_LOG_ADDR_UNREGISTERED ||
+			    g_cec_context.logical_address < 0 ||
 			    g_cec_context.logical_address > 15) {
 				CEC_LOG_ERROR("Invalid logical address: %d (0x%02X) - CEC discovery failed",
 							 g_cec_context.logical_address, g_cec_context.logical_address);
@@ -752,6 +789,11 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 
 	// Close CEC device
 	if (g_cec_context.fd >= 0) {
+		// Clear CEC logical addresses before closing
+		struct cec_log_addrs log_addrs;
+		memset(&log_addrs, 0, sizeof(log_addrs));
+		(void)ioctl(g_cec_context.fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs);
+
 		CEC_LOG_DEBUG("Closing CEC device fd=%d", g_cec_context.fd);
 		close(g_cec_context.fd);
 		g_cec_context.fd = -1;
@@ -766,8 +808,10 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	g_cec_context.rx_callback_data = NULL;
 	g_cec_context.tx_callback = NULL;
 	g_cec_context.tx_callback_data = NULL;
+	g_cec_context.tx_callback_gen = 0;
 	g_cec_context.logical_address = RPI_CEC_UNREGISTERED_ADDR;
 	g_cec_context.has_logical_address = false;
+	g_cec_context.physical_address = 0xFFFF;
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
@@ -1070,14 +1114,15 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	memcpy(msg.msg, buf, len);
 	msg.timeout = CEC_IOCTL_TIMEOUT_MS;
 
-	// Save callback references and generation counter to detect changes
+	// Save callback references, generation counter, and fd to detect changes
 	callback = g_cec_context.tx_callback;
 	callback_data = g_cec_context.tx_callback_data;
 	unsigned int callback_gen = g_cec_context.tx_callback_gen;
 	int saved_handle = handle; // Save handle from parameter for callback consistency
+	int saved_fd = g_cec_context.fd; // Save fd to detect if device was closed
 
 	// Send message (non-blocking mode already set on fd)
-	ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
+	ret = ioctl(saved_fd, CEC_TRANSMIT, &msg);
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
@@ -1087,9 +1132,12 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 		return HDMI_CEC_IO_SENT_FAILED;
 	}
 
-	// Call tx callback if registered and not changed during transmission
+	// Call tx callback if registered, not changed, and device still open
 	pthread_mutex_lock(&g_cec_context.mutex);
-	bool callback_valid = (callback != NULL && g_cec_context.tx_callback_gen == callback_gen);
+	bool callback_valid = (callback != NULL &&
+	                       g_cec_context.tx_callback_gen == callback_gen &&
+	                       g_cec_context.fd == saved_fd &&
+	                       g_cec_context.initialized);
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (callback_valid) {
@@ -1150,6 +1198,10 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 
 		// Close device file descriptor
 		if (fd_to_close >= 0) {
+			// Clear CEC logical addresses before closing
+			struct cec_log_addrs log_addrs;
+			memset(&log_addrs, 0, sizeof(log_addrs));
+			(void)ioctl(fd_to_close, CEC_ADAP_S_LOG_ADDRS, &log_addrs);
 			close(fd_to_close);
 		}
 
