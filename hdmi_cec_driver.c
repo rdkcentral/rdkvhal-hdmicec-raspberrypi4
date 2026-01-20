@@ -30,7 +30,6 @@
 #include <linux/cec.h>
 #include <poll.h>
 #include <time.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include "hdmi_cec_driver.h"
@@ -388,9 +387,19 @@ static void *cec_rx_thread(void *arg)
 	CEC_LOG_INFO("RX thread started, fd=%d", ctx->fd);
 
 	while (ctx->running) {
-		// Validate file descriptor before use
-		if (ctx->fd < 0) {
-			CEC_LOG_ERROR("Invalid file descriptor: %d", ctx->fd);
+		// Read fd under mutex protection to avoid race with HdmiCecClose
+		pthread_mutex_lock(&ctx->mutex);
+		int fd = ctx->fd;
+		bool running = ctx->running;
+		pthread_mutex_unlock(&ctx->mutex);
+
+		if (!running) {
+			break;
+		}
+
+		// Validate file descriptor
+		if (fd < 0) {
+			CEC_LOG_ERROR("Invalid file descriptor: %d", fd);
 			usleep(ERROR_RECOVERY_DELAY_MS * 1000);
 			consecutive_errors++;
 			if (consecutive_errors > MAX_CONSECUTIVE_ERRORS) {
@@ -401,7 +410,7 @@ static void *cec_rx_thread(void *arg)
 		}
 
 		// Use poll to avoid busy-waiting and detect errors
-		pfd.fd = ctx->fd;
+		pfd.fd = fd;
 		pfd.events = POLLIN | POLLERR | POLLHUP;
 		pfd.revents = 0;
 
@@ -450,7 +459,7 @@ static void *cec_rx_thread(void *arg)
 		msg.timeout = CEC_IOCTL_TIMEOUT_MS;
 
 		// Receive CEC message
-		if (ioctl(ctx->fd, CEC_RECEIVE, &msg) < 0) {
+		if (ioctl(fd, CEC_RECEIVE, &msg) < 0) {
 			if (errno == ETIMEDOUT || errno == EAGAIN) {
 				consecutive_errors = 0; // Not a critical error
 				CEC_LOG_TRACE("ioctl(CEC_RECEIVE) timeout/again");
@@ -586,9 +595,8 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	// Set vendor ID (Raspberry Pi Foundation)
 	log_addrs.vendor_id = RPI_CEC_VENDOR_ID;
 
-	// Configure OSD name
-	strncpy(log_addrs.osd_name, RPI_CEC_OSD_NAME, sizeof(log_addrs.osd_name));
-	log_addrs.osd_name[sizeof(log_addrs.osd_name) - 1] = '\0';
+	// Configure OSD name (snprintf handles both copying and null termination)
+	snprintf(log_addrs.osd_name, sizeof(log_addrs.osd_name), "%s", RPI_CEC_OSD_NAME);
 
 	// Configure CEC features for playback device
 	// RC Profile: Source has deck control
@@ -764,12 +772,6 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 	}
 
 	g_cec_context.physical_address = cec_convert_physical_address(log_addrs.phys_addr);
-
-	// Validate physical address
-	if (g_cec_context.physical_address > 0xFFFF) {
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_INVALID_OUTPUT;
-	}
 
 	*physicalAddress = g_cec_context.physical_address;
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -950,8 +952,21 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 	memcpy(msg.msg, buf, len);
 	msg.timeout = CEC_IOCTL_TIMEOUT_MS;
 
-	// Send message synchronously
-	ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
+	// Save fd before releasing mutex
+	int cec_fd = g_cec_context.fd;
+	pthread_mutex_unlock(&g_cec_context.mutex);
+
+	// Send message synchronously (release mutex to avoid blocking other threads)
+	ret = ioctl(cec_fd, CEC_TRANSMIT, &msg);
+
+	// Reacquire mutex and revalidate state
+	pthread_mutex_lock(&g_cec_context.mutex);
+	if (!g_cec_context.initialized || cec_fd != g_cec_context.fd) {
+		CEC_LOG_ERROR("CEC context changed during transmission");
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		*result = HDMI_CEC_IO_SENT_FAILED;
+		return HDMI_CEC_IO_SENT_FAILED;
+	}
 
 	if (ret < 0) {
 		CEC_LOG_ERROR("ioctl(CEC_TRANSMIT) failed: %s", strerror(errno));
@@ -1016,6 +1031,9 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	msg.timeout = CEC_IOCTL_TIMEOUT_MS;
 
 	// Save callback references before releasing mutex
+	// Note: There's a small window where the callback could be changed by another thread
+	// after we save these references but before we invoke. This is acceptable as the
+	// old callback is what the caller expects for this transmission.
 	callback = g_cec_context.tx_callback;
 	callback_data = g_cec_context.tx_callback_data;
 
@@ -1052,6 +1070,8 @@ static void __attribute__((constructor)) cec_driver_init(void)
 }
 
 // Cleanup at shutdown - ensure resources are released even if HdmiCecClose not called
+// Note: This destructor assumes single-threaded cleanup or that no other threads
+// are actively using CEC APIs when the library is unloaded.
 static void __attribute__((destructor)) cec_driver_fini(void)
 {
 	CEC_LOG_INFO("RPi4 CEC HAL driver cleanup");
@@ -1065,10 +1085,21 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		int fd_to_close = g_cec_context.fd;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 
-		// Stop RX thread if running
+		// Wait for RX thread to exit gracefully (do NOT use pthread_cancel)
+		// The thread will exit when it sees running = false
 		if (thread_to_join) {
-			pthread_cancel(thread_to_join);
-			pthread_join(thread_to_join, NULL);
+			struct timespec timeout_ts;
+			if (clock_gettime(CLOCK_REALTIME, &timeout_ts) == 0) {
+				timeout_ts.tv_sec += 2; // 2 second timeout
+				// Use timed join with short timeout; if it fails, thread will be abandoned
+				if (pthread_timedjoin_np(thread_to_join, NULL, &timeout_ts) != 0) {
+					CEC_LOG_WARN("Thread did not exit gracefully, may leak resources");
+					// Thread will be abandoned - this is safer than pthread_cancel
+				}
+			} else {
+				// Fallback to regular join with no timeout
+				pthread_join(thread_to_join, NULL);
+			}
 		}
 
 		// Close device file descriptor
@@ -1085,6 +1116,12 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		pthread_mutex_unlock(&g_cec_context.mutex);
 	}
 
+	// Close logging before destroying mutexes
 	cec_log_close();
+
+	// Destroy log mutex (assumes no other threads are logging)
+	pthread_mutex_destroy(&g_log_mutex);
+
+	// Destroy context mutex (safe now that thread is joined and device closed)
 	pthread_mutex_destroy(&g_cec_context.mutex);
 }
