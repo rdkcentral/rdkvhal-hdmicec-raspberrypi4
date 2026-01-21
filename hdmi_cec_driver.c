@@ -189,6 +189,9 @@ static void cec_log_init(void)
 				g_log_level = CEC_LOG_LEVEL_DEBUG;
 			} else if (strcmp(log_level_env, "TRACE") == 0) {
 				g_log_level = CEC_LOG_LEVEL_TRACE;
+			} else {
+				// Invalid log level - keep default and document valid values
+				// Valid values: ERROR, WARN, INFO, DEBUG, TRACE
 			}
 		}
 
@@ -199,7 +202,8 @@ static void cec_log_init(void)
 		struct stat st;
 		if (stat(CEC_LOG_DIR, &st) != 0) {
 			if (errno == ENOENT) {
-				if (mkdir(CEC_LOG_DIR, 0755) != 0 && errno != EEXIST) {
+				// Use symbolic mode: rwxr-xr-x (0755)
+				if (mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0 && errno != EEXIST) {
 					// Log directory creation failed, will try to create log file anyway
 				}
 			}
@@ -216,8 +220,13 @@ static void cec_log_init(void)
 					g_log_file = NULL;
 					char old_log[CEC_LOG_PATH_MAX];
 					snprintf(old_log, sizeof(old_log), "%s%s", log_file_path, CEC_LOG_FILE_SUFFIX);
-					(void)rename(log_file_path, old_log);
-					g_log_file = fopen(log_file_path, "a");
+					if (rename(log_file_path, old_log) != 0) {
+						// Rotation failed, truncate the existing log to prevent unbounded growth
+						g_log_file = fopen(log_file_path, "w");
+					} else {
+						// Rotation succeeded, start new log file
+						g_log_file = fopen(log_file_path, "a");
+					}
 				}
 			}
 
@@ -283,24 +292,27 @@ static void cec_log(int level, const char *func, int line, const char *format, .
 // Log buffer contents in hex
 static void cec_log_buffer(const char *prefix, const unsigned char *buf, int len)
 {
-	if (CEC_LOG_LEVEL_DEBUG > g_log_level || buf == NULL || len <= 0) {
+	if (buf == NULL || len <= 0) {
 		return;
 	}
 
-	// Check if logging is enabled under mutex to avoid TOCTOU race
+	// Check log level and file under mutex to avoid TOCTOU race
 	pthread_mutex_lock(&g_log_mutex);
 
-	if (g_log_file != NULL) {
-		char timestamp[CEC_TIMESTAMP_SIZE];
-		cec_get_timestamp(timestamp, sizeof(timestamp));
-
-		fprintf(g_log_file, "[%s] [DEBUG] %s (%d bytes): ", timestamp, prefix, len);
-		for (int i = 0; i < len && i < CEC_MAX_MSG_SIZE; i++) {
-			fprintf(g_log_file, "%02X ", buf[i]);
-		}
-		fprintf(g_log_file, "\n");
-		fflush(g_log_file);
+	if (CEC_LOG_LEVEL_DEBUG > g_log_level || g_log_file == NULL) {
+		pthread_mutex_unlock(&g_log_mutex);
+		return;
 	}
+
+	char timestamp[CEC_TIMESTAMP_SIZE];
+	cec_get_timestamp(timestamp, sizeof(timestamp));
+
+	fprintf(g_log_file, "[%s] [DEBUG] %s (%d bytes): ", timestamp, prefix, len);
+	for (int i = 0; i < len && i < CEC_MAX_MSG_SIZE; i++) {
+		fprintf(g_log_file, "%02X ", buf[i]);
+	}
+	fprintf(g_log_file, "\n");
+	fflush(g_log_file);
 
 	pthread_mutex_unlock(&g_log_mutex);
 }
@@ -399,8 +411,8 @@ static void *cec_rx_thread(void *arg)
 
 	CEC_LOG_INFO("RX thread started, fd=%d", ctx->fd);
 
-	while (ctx->running) {
-		// Read fd under mutex protection to avoid race with HdmiCecClose
+	while (true) {
+		// Read fd and running state under mutex protection
 		pthread_mutex_lock(&ctx->mutex);
 		int fd = ctx->fd;
 		bool running = ctx->running;
@@ -591,7 +603,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		// This happens when kernel doesn't have CEC support or wrong display driver
 		if (errno == ENOENT) {
 			CEC_LOG_ERROR("CEC device not found - CEC not supported on this system");
-			CEC_LOG_ERROR("Hint: Check if dtoverlay=vc4-kms-v3d is enabled in /boot/config.txt");
+			CEC_LOG_ERROR("Hint: Incompatible with 'fkms' driver configuration.");
 			pthread_mutex_unlock(&g_cec_context.mutex);
 			// Brief delay to avoid tight retry loops in caller.
 			usleep(ERROR_RECOVERY_DELAY_MS * 1000);
@@ -1127,10 +1139,11 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	int saved_handle = handle; // Save handle from parameter for callback consistency
 	int saved_fd = g_cec_context.fd; // Save fd to detect if device was closed
 
+	// Release mutex before potentially blocking ioctl to avoid delaying other threads
+	pthread_mutex_unlock(&g_cec_context.mutex);
+
 	// Send message (non-blocking mode already set on fd)
 	ret = ioctl(saved_fd, CEC_TRANSMIT, &msg);
-
-	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (ret < 0) {
 		CEC_LOG_ERROR("ioctl(CEC_TRANSMIT) failed: %s", strerror(errno));
