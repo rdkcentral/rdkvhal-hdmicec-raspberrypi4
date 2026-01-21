@@ -315,14 +315,16 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		return HDMI_CEC_IO_ALREADY_OPEN;
 	}
 
-	CEC_LOG_DEBUG("Initializing BCM host");
-	bcm_host_init();
+	// Skip bcm_host_init() - DeviceSettings HAL already initializes it
+	// bcm_host_init() can only be called once per system and causes conflicts
+	// if called from multiple processes/libraries
+	CEC_LOG_DEBUG("Skipping bcm_host_init (assumed already initialized by DeviceSettings)");
 
 	CEC_LOG_DEBUG("Initializing VCHI");
 	ret = vchi_initialise(&g_cec_context.vchi_instance);
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to initialize VCHI: %d", ret);
-		bcm_host_deinit();
+		// Don't call bcm_host_deinit() since we didn't call bcm_host_init()
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -331,7 +333,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to connect VCHI: %d", ret);
 		vchi_disconnect(g_cec_context.vchi_instance);
-		bcm_host_deinit();
+		// Don't call bcm_host_deinit() since we didn't call bcm_host_init()
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -400,7 +402,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	vc_cec_register_callback(NULL, NULL);
 	vc_vchi_cec_stop();
 	vchi_disconnect(g_cec_context.vchi_instance);
-	bcm_host_deinit();
+	// Don't call bcm_host_deinit() - DeviceSettings HAL owns the bcm_host lifecycle
 
 	g_cec_context.handle = 0;
 	g_cec_context.rx_callback = NULL;
@@ -641,7 +643,7 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		vc_cec_register_callback(NULL, NULL);
 		vc_vchi_cec_stop();
 		vchi_disconnect(g_cec_context.vchi_instance);
-		bcm_host_deinit();
+		// Don't call bcm_host_deinit() - DeviceSettings HAL owns the bcm_host lifecycle
 		g_cec_context.initialized = false;
 	}
 	pthread_mutex_unlock(&g_cec_context.mutex);
