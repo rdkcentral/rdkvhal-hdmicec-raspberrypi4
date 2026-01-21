@@ -36,7 +36,6 @@
 #include <stdarg.h>
 #include "hdmi_cec_driver.h"
 
-// Fallback version info if not provided by build system
 #ifndef HAL_VERSION
 #define HAL_VERSION "unknown"
 #endif
@@ -115,6 +114,7 @@ typedef struct {
 
 static FILE *g_log_file = NULL;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_log_init_once = PTHREAD_ONCE_INIT;
 
 // Default log level
 static int g_log_level = CEC_LOG_LEVEL_ERROR;
@@ -160,89 +160,93 @@ static const char* cec_get_log_level_str(int level)
 	}
 }
 
-// Initialize logging
-static void cec_log_init(void)
+// Initialize logging - internal function called by pthread_once
+static void cec_log_init_impl(void)
 {
 	pthread_mutex_lock(&g_log_mutex);
 
-	if (g_log_file == NULL) {
-		// Check if logging is explicitly requested via environment variables
-		const char *log_level_env = getenv("CEC_HAL_LOG_LEVEL");
-		const char *log_file_env = getenv("CEC_HAL_LOG_FILE");
+	// Check if logging is explicitly requested via environment variables
+	const char *log_level_env = getenv("CEC_HAL_LOG_LEVEL");
+	const char *log_file_env = getenv("CEC_HAL_LOG_FILE");
 
-		// Skip logging if no log level defined and log file not explicitly set
-		if (log_level_env == NULL && log_file_env == NULL) {
-			// No logging requested - keep g_log_file as NULL and return.
-			pthread_mutex_unlock(&g_log_mutex);
-			return;
+	// Skip logging if no log level defined and log file not explicitly set
+	if (log_level_env == NULL && log_file_env == NULL) {
+		// No logging requested - keep g_log_file as NULL
+		pthread_mutex_unlock(&g_log_mutex);
+		return;
+	}
+
+	// Read log level from environment variable
+	if (log_level_env != NULL) {
+		if (strcmp(log_level_env, "ERROR") == 0) {
+			g_log_level = CEC_LOG_LEVEL_ERROR;
+		} else if (strcmp(log_level_env, "WARN") == 0) {
+			g_log_level = CEC_LOG_LEVEL_WARN;
+		} else if (strcmp(log_level_env, "INFO") == 0) {
+			g_log_level = CEC_LOG_LEVEL_INFO;
+		} else if (strcmp(log_level_env, "DEBUG") == 0) {
+			g_log_level = CEC_LOG_LEVEL_DEBUG;
+		} else if (strcmp(log_level_env, "TRACE") == 0) {
+			g_log_level = CEC_LOG_LEVEL_TRACE;
+		} else {
+			// Invalid log level - keep default ERROR
+			// Valid values: ERROR, WARN, INFO, DEBUG, TRACE
 		}
+	}
 
-		// Read log level from environment variable
-		if (log_level_env != NULL) {
-			if (strcmp(log_level_env, "ERROR") == 0) {
-				g_log_level = CEC_LOG_LEVEL_ERROR;
-			} else if (strcmp(log_level_env, "WARN") == 0) {
-				g_log_level = CEC_LOG_LEVEL_WARN;
-			} else if (strcmp(log_level_env, "INFO") == 0) {
-				g_log_level = CEC_LOG_LEVEL_INFO;
-			} else if (strcmp(log_level_env, "DEBUG") == 0) {
-				g_log_level = CEC_LOG_LEVEL_DEBUG;
-			} else if (strcmp(log_level_env, "TRACE") == 0) {
-				g_log_level = CEC_LOG_LEVEL_TRACE;
-			} else {
-				// Invalid log level - keep default and document valid values
-				// Valid values: ERROR, WARN, INFO, DEBUG, TRACE
-			}
-		}
+	// Read log file path from environment variable
+	const char *log_file_path = log_file_env ? log_file_env : CEC_LOG_FILE_DEFAULT;
 
-		// Read log file path from environment variable (default to CEC_LOG_FILE_DEFAULT)
-		const char *log_file_path = log_file_env ? log_file_env : CEC_LOG_FILE_DEFAULT;
-
-		// Create directory if it doesn't exist
-		struct stat st;
-		if (stat(CEC_LOG_DIR, &st) != 0) {
-			if (errno == ENOENT) {
-				// Use symbolic mode: rwxr-xr-x (0755)
-				if (mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0 && errno != EEXIST) {
-					// Log directory creation failed, will try to create log file anyway
-				}
-			}
-		}
-
-		g_log_file = fopen(log_file_path, "a");
-		if (g_log_file != NULL) {
-			if (fseek(g_log_file, 0, SEEK_END) == 0) {
-				long size = ftell(g_log_file);
-
-				// Rotate log if exceeds max size and ftell succeeded
-				if (size > 0 && size > CEC_LOG_MAX_SIZE) {
-					fclose(g_log_file);
-					g_log_file = NULL;
-					char old_log[CEC_LOG_PATH_MAX];
-					snprintf(old_log, sizeof(old_log), "%s%s", log_file_path, CEC_LOG_FILE_SUFFIX);
-					if (rename(log_file_path, old_log) != 0) {
-						// Rotation failed, truncate the existing log to prevent unbounded growth
-						g_log_file = fopen(log_file_path, "w");
-					} else {
-						// Rotation succeeded, start new log file
-						g_log_file = fopen(log_file_path, "a");
-					}
-				}
-			}
-
-			// Disable buffering for immediate flush
-			if (g_log_file != NULL) {
-				setvbuf(g_log_file, NULL, _IOLBF, 0);
-
-				char timestamp[CEC_TIMESTAMP_SIZE];
-				cec_get_timestamp(timestamp, sizeof(timestamp));
-				fprintf(g_log_file, "\nCEC HAL Log Started: %s (Level: %s)\n",
-						timestamp, cec_get_log_level_str(g_log_level));
+	// Create directory if it doesn't exist
+	struct stat st;
+	if (stat(CEC_LOG_DIR, &st) != 0) {
+		if (errno == ENOENT) {
+			// Use symbolic mode: rwxr-xr-x
+			if (mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0 && errno != EEXIST) {
+				// Directory creation failed, continue anyway.
 			}
 		}
 	}
 
+	g_log_file = fopen(log_file_path, "a");
+	if (g_log_file != NULL) {
+		if (fseek(g_log_file, 0, SEEK_END) == 0) {
+			long size = ftell(g_log_file);
+
+			// Rotate log if exceeds max size
+			if (size > 0 && size > CEC_LOG_MAX_SIZE) {
+				fclose(g_log_file);
+				g_log_file = NULL;
+				char old_log[CEC_LOG_PATH_MAX];
+				snprintf(old_log, sizeof(old_log), "%s%s", log_file_path, CEC_LOG_FILE_SUFFIX);
+				if (rename(log_file_path, old_log) != 0) {
+					// Rotation failed, truncate to prevent unbounded growth
+					g_log_file = fopen(log_file_path, "w");
+				} else {
+					// Rotation succeeded, start new log
+					g_log_file = fopen(log_file_path, "a");
+				}
+			}
+		}
+
+		// Disable buffering for immediate flush
+		if (g_log_file != NULL) {
+			setvbuf(g_log_file, NULL, _IOLBF, 0);
+
+			char timestamp[CEC_TIMESTAMP_SIZE];
+			cec_get_timestamp(timestamp, sizeof(timestamp));
+			fprintf(g_log_file, "\nCEC HAL Log Started: %s (Level: %s)\n",
+					timestamp, cec_get_log_level_str(g_log_level));
+		}
+	}
+
 	pthread_mutex_unlock(&g_log_mutex);
+}
+
+// Initialize logging - thread-safe wrapper using pthread_once
+static void cec_log_init(void)
+{
+	pthread_once(&g_log_init_once, cec_log_init_impl);
 }
 
 // Close logging
@@ -333,43 +337,30 @@ static inline unsigned int cec_convert_physical_address(__u16 cec_phys_addr)
 	return (unsigned int)cec_phys_addr;
 }
 
-// Generate a secure random handle value (non-zero)
+// Generate a unique handle value (non-zero)
+// Uses monotonic clock and process ID for uniqueness without /dev/urandom overhead
 static int cec_generate_handle(void)
 {
 	int handle = 0;
-	int urandom_fd;
-
-	// Try to read from /dev/urandom for cryptographically secure random number
-	urandom_fd = open("/dev/urandom", O_RDONLY);
-	if (urandom_fd >= 0) {
-		if (read(urandom_fd, &handle, sizeof(handle)) == sizeof(handle)) {
-			close(urandom_fd);
-			// Ensure handle is positive and non-zero
-			handle = (handle & 0x7FFFFFFF);
-			if (handle == 0) {
-				handle = 1;
-			}
-			return handle;
-		}
-		close(urandom_fd);
-	}
-
-	// Fallback: use time-based randomization if /dev/urandom fails
 	struct timespec ts;
+
+	// Use monotonic clock with process ID for handle generation
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
 		// Combine seconds, nanoseconds, and process ID for uniqueness
 		handle = (int)((ts.tv_sec ^ ts.tv_nsec ^ getpid()) & 0x7FFFFFFF);
 		if (handle == 0) {
 			handle = (int)(ts.tv_nsec & 0x7FFFFFFF);
+			if (handle == 0) {
+				handle = 1;
+			}
 		}
+		return handle;
 	}
 
-	// Last resort: use current time
+	// Fallback: use wall clock time
+	handle = (int)(time(NULL) & 0x7FFFFFFF);
 	if (handle == 0) {
-		handle = (int)(time(NULL) & 0x7FFFFFFF);
-		if (handle == 0) {
-			handle = 1; // Absolute fallback
-		}
+		handle = 1; // Absolute fallback
 	}
 
 	return handle;
@@ -530,12 +521,7 @@ static void *cec_rx_thread(void *arg)
 
 		// Only process received messages (not transmit status reports)
 		// Received messages have tx_status == 0; TX status reports have flags set
-		// Note: This filters based on the kernel's message tagging. The kernel sets
-		// tx_status flags only for messages that are TX completions, not for received messages.
-		if (!(msg.tx_status & CEC_TX_STATUS_OK) &&
-			!(msg.tx_status & CEC_TX_STATUS_NACK) &&
-			!(msg.tx_status & CEC_TX_STATUS_ERROR)) {
-
+		if (msg.tx_status == 0) {
 			// Convert CEC message to HAL format
 			len = msg.len;
 			if (len > 0 && len <= CEC_MAX_MSG_SIZE) {
@@ -543,12 +529,7 @@ static void *cec_rx_thread(void *arg)
 
 				CEC_LOG_INFO("Received CEC message: len=%d", len);
 				CEC_LOG_BUFFER("RX", buf, len);
-
-				// Copy callback references under mutex protection, then invoke outside mutex
-				pthread_mutex_lock(&ctx->mutex);
-				HdmiCecRxCallback_t rx_callback = ctx->rx_callback;
-				void *rx_callback_data = ctx->rx_callback_data;
-				int callback_handle = ctx->handle;
+				// Call RX callback if registered and still running
 				bool should_call = ctx->running && ctx->initialized && rx_callback != NULL;
 				pthread_mutex_unlock(&ctx->mutex);
 
@@ -592,7 +573,6 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		return HDMI_CEC_IO_ALREADY_OPEN;
 	}
 
-	// Open CEC device (HDMI0)
 	CEC_LOG_DEBUG("Opening CEC device: %s", CEC_DEVICE_PATH);
 	g_cec_context.fd = open(CEC_DEVICE_PATH, O_RDWR | O_NONBLOCK);
 	if (g_cec_context.fd < 0) {
@@ -965,7 +945,7 @@ HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int* logicalAddress)
 	return HDMI_CEC_IO_SUCCESS;
 }
 
-HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t cbfunc, void* data)
+HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t callback, void* data)
 {
 	pthread_mutex_lock(&g_cec_context.mutex);
 
@@ -979,14 +959,14 @@ HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t cbfunc, voi
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
-	g_cec_context.rx_callback = cbfunc;
+	g_cec_context.rx_callback = callback;
 	g_cec_context.rx_callback_data = data;
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 	return HDMI_CEC_IO_SUCCESS;
 }
 
-HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, void* data)
+HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t callback, void* data)
 {
 	pthread_mutex_lock(&g_cec_context.mutex);
 
@@ -1000,7 +980,7 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t cbfunc, voi
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
-	g_cec_context.tx_callback = cbfunc;
+	g_cec_context.tx_callback = callback;
 	g_cec_context.tx_callback_data = data;
 	g_cec_context.tx_callback_gen++; // Invalidate any in-flight async callbacks
 
@@ -1182,16 +1162,16 @@ static void __attribute__((constructor)) cec_driver_init(void)
 }
 
 // Cleanup at shutdown - ensure resources are released even if HdmiCecClose not called
-// Note: This destructor assumes single-threaded cleanup or that no other threads
-// are actively using CEC APIs when the library is unloaded.
+// The destructor is only safe when called at process exit or when the library
+// user has ensured all CEC operations have completed and HdmiCecClose was called.
 static void __attribute__((destructor)) cec_driver_fini(void)
 {
 	CEC_LOG_INFO("RPi4 CEC HAL driver cleanup");
-
-	// Check if CEC device is still open and clean up
 	pthread_mutex_lock(&g_cec_context.mutex);
 	if (g_cec_context.initialized) {
-		CEC_LOG_WARN("CEC device still open during shutdown, forcing cleanup");
+		CEC_LOG_WARN("CEC device still open during shutdown - this indicates improper cleanup");
+		CEC_LOG_WARN("HdmiCecClose MUST be called before library unload to ensure thread safety");
+		CEC_LOG_WARN("Continuing with forced cleanup - concurrent API calls may crash");
 		g_cec_context.running = false;
 		bool thread_was_created = g_cec_context.thread_created;
 		pthread_t thread_to_join = g_cec_context.rx_thread;
