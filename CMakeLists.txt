@@ -1,16 +1,11 @@
 # Minimum CMake version required
 cmake_minimum_required(VERSION 3.10)
 
-# Version is matched with the version of hdmicecheader - 1.3.7.
+# RCECHal version
 project(RCECHal VERSION 1.4.0 LANGUAGES C)
 
 set(LIBNAME RCECHal)
 set(DEFAULT_BUILD_TYPE "Release")
-
-set_target_properties(${LIBNAME} PROPERTIES
-	VERSION ${PROJECT_VERSION}
-	SOVERSION ${PROJECT_VERSION}
-)
 
 message(STATUS "Building with USERLAND-based CEC implementation (experimental)")
 set(SRCS hdmi_cec_driver_userland.c)
@@ -49,9 +44,21 @@ if(NOT HDMI_CEC_INCLUDE_DIR)
     set(HDMI_CEC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../rdk-halif-hdmi_cec/include)
 endif()
 
+# Configurable include directory for VMCS host Linux headers
+set(VMCS_HOST_INCLUDE_DIR "/usr/include/interface/vmcs_host/linux" CACHE PATH "Path to VMCS host Linux headers")
+if(NOT EXISTS "${VMCS_HOST_INCLUDE_DIR}")
+    message(WARNING "VMCS host include directory '${VMCS_HOST_INCLUDE_DIR}' does not exist. Adjust VMCS_HOST_INCLUDE_DIR if needed.")
+endif()
+
 add_library(${LIBNAME} SHARED ${SRCS})
+
+set_target_properties(${LIBNAME} PROPERTIES
+	VERSION ${PROJECT_VERSION}
+	SOVERSION ${PROJECT_VERSION}
+)
+
 target_include_directories(${LIBNAME} PRIVATE ${HDMI_CEC_INCLUDE_DIR})
-target_include_directories(${LIBNAME} PRIVATE /usr/include/interface/vmcs_host/linux)
+target_include_directories(${LIBNAME} PRIVATE ${VMCS_HOST_INCLUDE_DIR})
 target_link_libraries(${LIBNAME} PRIVATE vchostif vchiq_arm vcos pthread)
 
 target_compile_definitions(${LIBNAME} PRIVATE
