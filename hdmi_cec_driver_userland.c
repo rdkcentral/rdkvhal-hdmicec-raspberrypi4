@@ -93,7 +93,6 @@
 typedef struct {
 	VCHI_INSTANCE_T vchi_instance;
 	VCHI_CONNECTION_T *vchi_connection;
-	CECSERVICE_HOST_STATE_T cec_host_state;
 	int handle;
 	bool initialized;
 	bool running;
@@ -340,27 +339,20 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	CEC_LOG_DEBUG("Initializing CEC service");
 	vc_vchi_cec_init(g_cec_context.vchi_instance, &g_cec_context.vchi_connection, 1);
 
-	ret = vc_cec_register_callback(cec_rx_callback_handler, &g_cec_context);
-	if (ret != 0) {
-		CEC_LOG_ERROR("Failed to register CEC callback: %d", ret);
-		vc_vchi_cec_stop();
-		vchi_disconnect(g_cec_context.vchi_instance);
-		bcm_host_deinit();
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_GENERAL_ERROR;
-	}
+	CEC_LOG_DEBUG("Registering CEC callback");
+	vc_cec_register_callback(cec_rx_callback_handler, &g_cec_context);
 
 	CEC_LOG_DEBUG("Setting CEC logical address");
-	ret = vc_cec_set_logical_address(CEC_AllDevices_ePlayback, CEC_DeviceType_Playback, RPI_CEC_VENDOR_ID);
+	ret = vc_cec_set_logical_address(CEC_LOGADDR_PLAYBACK1, CEC_DeviceType_Playback, RPI_CEC_VENDOR_ID);
 	if (ret != 0) {
 		CEC_LOG_WARN("Failed to set logical address: %d", ret);
 	}
 
-	CEC_TOPOLOGY_T topology;
+	VC_CEC_TOPOLOGY_T topology;
 	ret = vc_cec_get_topology(&topology);
 	if (ret == 0) {
-		g_cec_context.physical_address = topology.physical_address;
-		g_cec_context.logical_address = topology.device_attr;
+		g_cec_context.physical_address = topology.active_source_pa;
+		g_cec_context.logical_address = topology.active_source;
 		g_cec_context.has_logical_address = (g_cec_context.logical_address < 15);
 		CEC_LOG_INFO("Logical address: %d, Physical address: 0x%04x",
 					g_cec_context.logical_address, g_cec_context.physical_address);
@@ -443,9 +435,10 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
-	CEC_TOPOLOGY_T topology;
+	VC_CEC_TOPOLOGY_T topology;
+	memset(&topology, 0, sizeof(topology));
 	if (vc_cec_get_topology(&topology) == 0) {
-		g_cec_context.physical_address = topology.physical_address;
+		g_cec_context.physical_address = topology.active_source_pa;
 	}
 
 	*physicalAddress = g_cec_context.physical_address;
@@ -586,11 +579,11 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	uint8_t follower = buf[0] & 0x0F;
-	uint8_t opcode = (len > 1) ? buf[1] : 0xFF;
-	uint8_t *params = (len > 2) ? (uint8_t*)&buf[2] : NULL;
-	uint32_t param_len = (len > 2) ? (len - 2) : 0;
+	// vc_cec_send_message expects: follower, payload (opcode+params), length
+	uint8_t *payload = (len > 1) ? (uint8_t*)&buf[1] : NULL;
+	uint32_t payload_len = (len > 1) ? (len - 1) : 0;
 
-	int32_t ret = vc_cec_send_message(follower, opcode, params, param_len, VC_TRUE);
+	int32_t ret = vc_cec_send_message(follower, payload, payload_len);
 
 	if (ret == 0) {
 		*result = HDMI_CEC_IO_SENT_AND_ACKD;
@@ -626,11 +619,11 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	uint8_t follower = buf[0] & 0x0F;
-	uint8_t opcode = (len > 1) ? buf[1] : 0xFF;
-	uint8_t *params = (len > 2) ? (uint8_t*)&buf[2] : NULL;
-	uint32_t param_len = (len > 2) ? (len - 2) : 0;
+	// vc_cec_send_message expects: follower, payload (opcode+params), length
+	uint8_t *payload = (len > 1) ? (uint8_t*)&buf[1] : NULL;
+	uint32_t payload_len = (len > 1) ? (len - 1) : 0;
 
-	vc_cec_send_message(follower, opcode, params, param_len, VC_FALSE);
+	vc_cec_send_message(follower, payload, payload_len);
 
 	return HDMI_CEC_IO_SUCCESS;
 }
