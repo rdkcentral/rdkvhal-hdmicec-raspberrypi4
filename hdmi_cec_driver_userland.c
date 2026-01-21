@@ -18,18 +18,11 @@
  */
 
 /*
- * EXPERIMENTAL: Raspberry Pi Userland-based CEC HAL Implementation
+ * Raspberry Pi Userland-based CEC HAL Implementation
  *
- * WARNING: This is an experimental implementation attempting to use VideoCore
- * firmware CEC capabilities through userland libraries. The userland library
- * does not have public CEC APIs, so this implementation may not work.
- *
- * This implementation tries to:
- * 1. Use bcm_host to initialize VideoCore
- * 2. Attempt VCHI/VCHIQ communication for CEC
- * 3. Use mailbox properties for CEC control (if available)
- *
- * For production, use the kernel-based implementation (hdmi_cec_driver.c)
+ * This implementation:
+ * - Uses the Raspberry Pi Userland VCHI interface to communicate with the VideoCore firmware for CEC operations.
+ * - Supports basic CEC operations for source devices (e.g., playback devices).
  */
 
 #include <string.h>
@@ -286,9 +279,10 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 		HdmiCecTxCallback_t tx_callback = ctx->tx_callback;
 		void *tx_callback_data = ctx->tx_callback_data;
 		int callback_handle = ctx->handle;
+		bool should_call = ctx->running && ctx->initialized && tx_callback != NULL;
 		pthread_mutex_unlock(&ctx->mutex);
 
-		if (tx_callback) {
+		if (should_call) {
 			int result = (param1 == 0) ? HDMI_CEC_IO_SENT_AND_ACKD :
 			             (param1 == 1) ? HDMI_CEC_IO_SENT_BUT_NOT_ACKD :
 			             HDMI_CEC_IO_SENT_FAILED;
@@ -300,6 +294,7 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 {
 	int32_t ret;
+	cec_log_init();
 	if (handle == NULL) {
 		CEC_LOG_ERROR("Invalid argument: handle is NULL");
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
@@ -328,6 +323,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	ret = vchi_connect(NULL, 0, g_cec_context.vchi_instance);
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to connect VCHI: %d", ret);
+		vchi_disconnect(g_cec_context.vchi_instance);
 		g_cec_context.vchi_instance = NULL;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
@@ -642,19 +638,21 @@ static void __attribute__((constructor)) cec_driver_init(void)
 
 static void __attribute__((destructor)) cec_driver_fini(void)
 {
-	CEC_LOG_INFO("RPi4 CEC HAL driver cleanup");
-	pthread_mutex_lock(&g_cec_context.mutex);
-	if (g_cec_context.initialized) {
-		CEC_LOG_WARN("CEC device still open during shutdown");
-		g_cec_context.running = false;
-		vc_cec_register_callback(NULL, NULL);
-		vc_vchi_cec_stop();
-		vchi_disconnect(g_cec_context.vchi_instance);
-		g_cec_context.vchi_instance = NULL;
-		g_cec_context.vchi_connection = NULL;
-		// Don't call bcm_host_deinit() - DeviceSettings HAL owns the bcm_host lifecycle
-		g_cec_context.initialized = false;
+	int lock_result = pthread_mutex_trylock(&g_cec_context.mutex);
+	if (lock_result == 0) {
+		if (g_cec_context.initialized) {
+			CEC_LOG_WARN("CEC device still open during shutdown");
+			g_cec_context.running = false;
+			vc_cec_register_callback(NULL, NULL);
+			vc_vchi_cec_stop();
+			vchi_disconnect(g_cec_context.vchi_instance);
+			g_cec_context.vchi_instance = NULL;
+			g_cec_context.vchi_connection = NULL;
+			// Don't call bcm_host_deinit() - DeviceSettings HAL owns the bcm_host lifecycle
+			g_cec_context.initialized = false;
+		}
+		pthread_mutex_unlock(&g_cec_context.mutex);
 	}
-	pthread_mutex_unlock(&g_cec_context.mutex);
+	// Always close log, even if we couldn't acquire mutex
 	cec_log_close();
 }
