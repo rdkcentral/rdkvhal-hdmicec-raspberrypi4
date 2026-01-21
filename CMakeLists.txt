@@ -35,10 +35,6 @@ if(NOT GIT_COMMIT_SHA)
     set(GIT_COMMIT_SHA "unknown")
 endif()
 message(STATUS "Git commit SHA: ${GIT_COMMIT_SHA}")
-target_compile_definitions(${LIBNAME} PRIVATE
-    HAL_VERSION="${PROJECT_VERSION}"
-    GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
-)
 
 find_path(HDMI_CEC_INCLUDE_DIR hdmi_cec_driver.h
     PATHS
@@ -57,6 +53,11 @@ add_library(${LIBNAME} SHARED ${SRCS})
 target_include_directories(${LIBNAME} PRIVATE ${HDMI_CEC_INCLUDE_DIR})
 target_include_directories(${LIBNAME} PRIVATE /usr/include/interface/vmcs_host/linux)
 target_link_libraries(${LIBNAME} PRIVATE vchostif vchiq_arm vcos pthread)
+
+target_compile_definitions(${LIBNAME} PRIVATE
+    HAL_VERSION="${PROJECT_VERSION}"
+    GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
+)
 
 add_custom_target(clean-all
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/clean.cmake

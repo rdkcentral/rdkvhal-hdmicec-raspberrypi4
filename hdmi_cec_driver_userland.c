@@ -107,7 +107,6 @@ typedef struct {
 	void *rx_callback_data;
 	HdmiCecTxCallback_t tx_callback;
 	void *tx_callback_data;
-	unsigned int tx_callback_gen;
 	int logical_address;
 	unsigned int physical_address;
 	bool has_logical_address;
@@ -255,7 +254,6 @@ static cec_context_t g_cec_context = {
 	.rx_callback_data = NULL,
 	.tx_callback = NULL,
 	.tx_callback_data = NULL,
-	.tx_callback_gen = 0,
 	.logical_address = RPI_CEC_UNREGISTERED_ADDR,
 	.physical_address = 0xFFFF,
 	.has_logical_address = false
@@ -270,7 +268,15 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 		uint32_t msg_len = param1;
 
 		if (msg_len > 0 && msg_len <= CEC_MAX_MSG_SIZE) {
-			memcpy(buf, (void*)param2, msg_len);
+			uint32_t words[3];
+			words[0] = param2;
+			words[1] = param3;
+			words[2] = param4;
+			for (uint32_t i = 0; i < msg_len; ++i) {
+				uint32_t word_index = i / 4;
+				uint32_t byte_shift = (i % 4U) * 8U;
+				buf[i] = (unsigned char)((words[word_index] >> byte_shift) & 0xFFU);
+			}
 
 			CEC_LOG_INFO("Received CEC message: len=%d", msg_len);
 
@@ -292,7 +298,6 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 		HdmiCecTxCallback_t tx_callback = ctx->tx_callback;
 		void *tx_callback_data = ctx->tx_callback_data;
 		int callback_handle = ctx->handle;
-		unsigned int callback_gen = ctx->tx_callback_gen;
 		pthread_mutex_unlock(&ctx->mutex);
 
 		if (tx_callback) {
@@ -347,7 +352,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	CEC_LOG_DEBUG("Registering CEC callback");
 	vc_cec_register_callback(cec_rx_callback_handler, &g_cec_context);
 
-	CEC_LOG_DEBUG("Setting CEC logical address 0x%02x and vendor ID 0x%06x", RPI_CEC_DEVICE_TYPE, RPI_CEC_VENDOR_ID);
+	CEC_LOG_DEBUG("Setting CEC device type %u and vendor ID 0x%06x", RPI_CEC_DEVICE_TYPE, RPI_CEC_VENDOR_ID);
 	ret = vc_cec_set_logical_address(RPI_CEC_DEVICE_TYPE, CEC_DeviceType_Playback, RPI_CEC_VENDOR_ID);
 	if (ret != 0) {
 		CEC_LOG_WARN("Failed to set logical address: %d", ret);
@@ -359,13 +364,18 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	VC_CEC_TOPOLOGY_T topology;
 	ret = vc_cec_get_topology(&topology);
 	if (ret == 0) {
-		g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
+		/* Use physical address from topology, fallback to default if invalid */
+		if (topology.physical_address != 0 && topology.physical_address != RPI_CEC_UNKNOWN_PHYSICAL_ADDR) {
+			g_cec_context.physical_address = topology.physical_address;
+		} else {
+			g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
+		}
 		g_cec_context.logical_address = RPI_CEC_DEVICE_TYPE;
 		g_cec_context.has_logical_address = true;
 		CEC_LOG_INFO("Logical address: %d, Physical address: 0x%04x",
-					g_cec_context.logical_address, g_cec_context.physical_address);
+				g_cec_context.logical_address, g_cec_context.physical_address);
 	} else {
-		CEC_LOG_WARN("Failed to get topology: %d", ret);
+		CEC_LOG_WARN("Failed to get topology: %d, setting to default.", ret);
 		g_cec_context.physical_address = RPI_CEC_UNKNOWN_PHYSICAL_ADDR;
 		g_cec_context.logical_address = RPI_CEC_UNREGISTERED_ADDR;
 		g_cec_context.has_logical_address = false;
@@ -413,7 +423,6 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	g_cec_context.rx_callback_data = NULL;
 	g_cec_context.tx_callback = NULL;
 	g_cec_context.tx_callback_data = NULL;
-	g_cec_context.tx_callback_gen = 0;
 	g_cec_context.logical_address = RPI_CEC_UNREGISTERED_ADDR;
 	g_cec_context.has_logical_address = false;
 	g_cec_context.physical_address = 0xFFFF;
@@ -549,7 +558,6 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t callback, v
 
 	g_cec_context.tx_callback = callback;
 	g_cec_context.tx_callback_data = data;
-	g_cec_context.tx_callback_gen++;
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 	return HDMI_CEC_IO_SUCCESS;
@@ -582,9 +590,14 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	uint8_t follower = buf[0] & 0x0F;
-	// vc_cec_send_message expects: follower, payload (opcode+params), length, is_reply
-	uint8_t *payload = (len > 1) ? (uint8_t*)&buf[1] : NULL;
-	uint32_t payload_len = (len > 1) ? (len - 1) : 0;
+	uint8_t payload_buf[CEC_MAX_MSG_SIZE - 1];
+	uint8_t *payload = NULL;
+	uint32_t payload_len = 0;
+	if (len > 1) {
+		payload_len = (uint32_t)(len - 1);
+		memcpy(payload_buf, &buf[1], payload_len);
+		payload = payload_buf;
+	}
 
 	int32_t ret = vc_cec_send_message(follower, payload, payload_len, VC_TRUE);
 
