@@ -76,6 +76,10 @@
 #define RPI_CEC_OSD_NAME "Raspberry Pi"
 #define RPI_CEC_UNREGISTERED_ADDR 0x0F
 
+#define RPI_CEC_DEFAULT_PHYSICAL_ADDR 0x1000
+#define RPI_CEC_UNKNOWN_PHYSICAL_ADDR 0xFFFF
+#define RPI_CEC_DEVICE_TYPE 4 // STB/Playback Device 1
+
 // Log levels
 #define CEC_LOG_LEVEL_ERROR   0
 #define CEC_LOG_LEVEL_WARN    1
@@ -171,7 +175,11 @@ static void cec_log_init_impl(void)
 	const char *log_file_path = log_file_env ? log_file_env : CEC_LOG_FILE_DEFAULT;
 	struct stat st;
 	if (stat(CEC_LOG_DIR, &st) != 0 && errno == ENOENT) {
-		mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+		if (mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0 && errno != EEXIST) {
+			pthread_mutex_unlock(&g_log_mutex);
+			fprintf(stderr, "CEC HAL: Failed to create log directory '%s': %s\n", CEC_LOG_DIR, strerror(errno));
+			return;
+		}
 	}
 
 	g_log_file = fopen(log_file_path, "a");
@@ -179,7 +187,7 @@ static void cec_log_init_impl(void)
 		setvbuf(g_log_file, NULL, _IOLBF, 0);
 		char timestamp[CEC_TIMESTAMP_SIZE];
 		cec_get_timestamp(timestamp, sizeof(timestamp));
-		fprintf(g_log_file, "\nCEC HAL Log Started (USERLAND): %s (Level: %s)\n",
+		fprintf(g_log_file, "CEC HAL Log Started (USERLAND): %s (Level: %s)\n",
 				timestamp, cec_get_log_level_str(g_log_level));
 	}
 
@@ -299,9 +307,6 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 {
 	int32_t ret;
-
-	CEC_LOG_INFO("%s (USERLAND implementation)", __func__);
-
 	if (handle == NULL) {
 		CEC_LOG_ERROR("Invalid argument: handle is NULL");
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
@@ -318,13 +323,11 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	// Skip bcm_host_init() - DeviceSettings HAL already initializes it
 	// bcm_host_init() can only be called once per system and causes conflicts
 	// if called from multiple processes/libraries
-	CEC_LOG_DEBUG("Skipping bcm_host_init (assumed already initialized by DeviceSettings)");
 
 	CEC_LOG_DEBUG("Initializing VCHI");
 	ret = vchi_initialise(&g_cec_context.vchi_instance);
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to initialize VCHI: %d", ret);
-		// Don't call bcm_host_deinit() since we didn't call bcm_host_init()
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -333,7 +336,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to connect VCHI: %d", ret);
 		vchi_disconnect(g_cec_context.vchi_instance);
-		// Don't call bcm_host_deinit() since we didn't call bcm_host_init()
+		g_cec_context.vchi_instance = NULL;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -344,25 +347,26 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	CEC_LOG_DEBUG("Registering CEC callback");
 	vc_cec_register_callback(cec_rx_callback_handler, &g_cec_context);
 
-	CEC_LOG_DEBUG("Setting CEC logical address");
-	// Logical address 4 = Playback Device 1
-	ret = vc_cec_set_logical_address(4, CEC_DeviceType_Playback, RPI_CEC_VENDOR_ID);
+	CEC_LOG_DEBUG("Setting CEC logical address 0x%02x and vendor ID 0x%06x", RPI_CEC_DEVICE_TYPE, RPI_CEC_VENDOR_ID);
+	ret = vc_cec_set_logical_address(RPI_CEC_DEVICE_TYPE, CEC_DeviceType_Playback, RPI_CEC_VENDOR_ID);
 	if (ret != 0) {
 		CEC_LOG_WARN("Failed to set logical address: %d", ret);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+
+		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
 	VC_CEC_TOPOLOGY_T topology;
 	ret = vc_cec_get_topology(&topology);
 	if (ret == 0) {
-		// Note: topology fields vary by userland version, using defaults
-		g_cec_context.physical_address = 0x1000; // Default physical address
-		g_cec_context.logical_address = 4; // Playback device 1
+		g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
+		g_cec_context.logical_address = RPI_CEC_DEVICE_TYPE;
 		g_cec_context.has_logical_address = true;
 		CEC_LOG_INFO("Logical address: %d, Physical address: 0x%04x",
 					g_cec_context.logical_address, g_cec_context.physical_address);
 	} else {
 		CEC_LOG_WARN("Failed to get topology: %d", ret);
-		g_cec_context.physical_address = 0xFFFF;
+		g_cec_context.physical_address = RPI_CEC_UNKNOWN_PHYSICAL_ADDR;
 		g_cec_context.logical_address = RPI_CEC_UNREGISTERED_ADDR;
 		g_cec_context.has_logical_address = false;
 	}
@@ -622,7 +626,10 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	uint8_t *payload = (len > 1) ? (uint8_t*)&buf[1] : NULL;
 	uint32_t payload_len = (len > 1) ? (len - 1) : 0;
 
-	vc_cec_send_message(follower, payload, payload_len, VC_FALSE);
+	if (vc_cec_send_message(follower, payload, payload_len, VC_FALSE)) {
+		CEC_LOG_ERROR("Failed to send CEC message asynchronously");
+		return HDMI_CEC_IO_SENT_FAILED;
+	}
 
 	return HDMI_CEC_IO_SUCCESS;
 }

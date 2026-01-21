@@ -2,21 +2,18 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Version is matched with the version of hdmicecheader - 1.3.7.
-project(RCECHal VERSION 1.3.7 LANGUAGES C)
+project(RCECHal VERSION 1.4.0 LANGUAGES C)
 
 set(LIBNAME RCECHal)
 set(DEFAULT_BUILD_TYPE "Release")
 
-# Build option to choose between kernel-based and userland-based implementation
-option(USE_USERLAND_CEC "Use Raspberry Pi userland-based CEC implementation (experimental)" OFF)
+set_target_properties(${LIBNAME} PROPERTIES
+	VERSION ${PROJECT_VERSION}
+	SOVERSION ${PROJECT_VERSION}
+)
 
-if(USE_USERLAND_CEC)
-    message(STATUS "Building with USERLAND-based CEC implementation (experimental)")
-    set(SRCS hdmi_cec_driver_userland.c)
-else()
-    message(STATUS "Building with KERNEL-based CEC implementation (default)")
-    set(SRCS hdmi_cec_driver.c)
-endif()
+message(STATUS "Building with USERLAND-based CEC implementation (experimental)")
+set(SRCS hdmi_cec_driver_userland.c)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 	message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
@@ -34,14 +31,15 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
 )
-
 if(NOT GIT_COMMIT_SHA)
     set(GIT_COMMIT_SHA "unknown")
 endif()
-
 message(STATUS "Git commit SHA: ${GIT_COMMIT_SHA}")
+target_compile_definitions(${LIBNAME} PRIVATE
+    HAL_VERSION="${PROJECT_VERSION}"
+    GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
+)
 
-# Find the HDMI CEC HAL interface header
 find_path(HDMI_CEC_INCLUDE_DIR hdmi_cec_driver.h
     PATHS
         ${CMAKE_CURRENT_SOURCE_DIR}/../rdk-halif-hdmi_cec/include
@@ -56,29 +54,9 @@ if(NOT HDMI_CEC_INCLUDE_DIR)
 endif()
 
 add_library(${LIBNAME} SHARED ${SRCS})
-
 target_include_directories(${LIBNAME} PRIVATE ${HDMI_CEC_INCLUDE_DIR})
-
-# Define version information as compile definitions
-target_compile_definitions(${LIBNAME} PRIVATE
-    HAL_VERSION="${PROJECT_VERSION}"
-    GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
-)
-
-# Link required libraries
-if(USE_USERLAND_CEC)
-    # Find userland library paths
-    include_directories(/usr/include/interface/vmcs_host/linux)
-    target_link_libraries(${LIBNAME} vchostif vchiq_arm vcos pthread)
-else()
-    # Kernel-based implementation only needs pthread
-    target_link_libraries(${LIBNAME} PRIVATE pthread)
-endif()
-
-set_target_properties(${LIBNAME} PROPERTIES
-	VERSION ${PROJECT_VERSION}
-	SOVERSION ${PROJECT_VERSION}
-)
+target_include_directories(${LIBNAME} PRIVATE /usr/include/interface/vmcs_host/linux)
+target_link_libraries(${LIBNAME} PRIVATE vchostif vchiq_arm vcos pthread)
 
 add_custom_target(clean-all
     COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/clean.cmake
