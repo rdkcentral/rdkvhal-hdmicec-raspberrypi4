@@ -5,8 +5,18 @@ cmake_minimum_required(VERSION 3.10)
 project(RCECHal VERSION 1.3.7 LANGUAGES C)
 
 set(LIBNAME RCECHal)
-set(SRCS hdmi_cec_driver.c)
 set(DEFAULT_BUILD_TYPE "Release")
+
+# Build option to choose between kernel-based and userland-based implementation
+option(USE_USERLAND_CEC "Use Raspberry Pi userland-based CEC implementation (experimental)" OFF)
+
+if(USE_USERLAND_CEC)
+    message(STATUS "Building with USERLAND-based CEC implementation (experimental)")
+    set(SRCS hdmi_cec_driver_userland.c)
+else()
+    message(STATUS "Building with KERNEL-based CEC implementation (default)")
+    set(SRCS hdmi_cec_driver.c)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 	message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
@@ -55,8 +65,54 @@ target_compile_definitions(${LIBNAME} PRIVATE
     GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
 )
 
-# Link pthread library
-target_link_libraries(${LIBNAME} PRIVATE pthread)
+# Link required libraries
+if(USE_USERLAND_CEC)
+    # Find userland library paths
+    find_path(USERLAND_INCLUDE_DIR interface/vchi/vchi.h
+        PATHS
+            /opt/vc/include
+            /usr/include
+        NO_DEFAULT_PATH
+    )
+
+    find_library(BCM_HOST_LIB bcm_host
+        PATHS
+            /opt/vc/lib
+            /usr/lib
+        NO_DEFAULT_PATH
+    )
+
+    find_library(VCHIQ_ARM_LIB vchiq_arm
+        PATHS
+            /opt/vc/lib
+            /usr/lib
+        NO_DEFAULT_PATH
+    )
+
+    find_library(VCOS_LIB vcos
+        PATHS
+            /opt/vc/lib
+            /usr/lib
+        NO_DEFAULT_PATH
+    )
+
+    if(NOT USERLAND_INCLUDE_DIR OR NOT BCM_HOST_LIB)
+        message(FATAL_ERROR "Userland libraries not found. Install raspberrypi-userland package or disable USE_USERLAND_CEC")
+    endif()
+
+    target_include_directories(${LIBNAME} PRIVATE ${USERLAND_INCLUDE_DIR})
+    target_link_libraries(${LIBNAME} PRIVATE
+        pthread
+        ${BCM_HOST_LIB}
+        ${VCHIQ_ARM_LIB}
+        ${VCOS_LIB}
+    )
+
+    message(STATUS "Using userland libraries from: ${USERLAND_INCLUDE_DIR}")
+else()
+    # Kernel-based implementation only needs pthread
+    target_link_libraries(${LIBNAME} PRIVATE pthread)
+endif()
 
 set_target_properties(${LIBNAME} PROPERTIES
 	VERSION ${PROJECT_VERSION}
