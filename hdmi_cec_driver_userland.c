@@ -38,7 +38,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
@@ -71,7 +70,6 @@
 #define RPI_CEC_UNREGISTERED_ADDR 0x0F
 
 #define RPI_CEC_DEFAULT_PHYSICAL_ADDR 0x1000
-#define RPI_CEC_UNKNOWN_PHYSICAL_ADDR 0xFFFF
 #define RPI_CEC_DEVICE_TYPE 4 // STB/Playback Device 1
 
 // Log levels
@@ -353,25 +351,14 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
-	VC_CEC_TOPOLOGY_T topology;
-	ret = vc_cec_get_topology(&topology);
-	if (ret == 0) {
-		/* Use physical address from topology, fallback to default if invalid */
-		if (topology.physical_address != 0 && topology.physical_address != RPI_CEC_UNKNOWN_PHYSICAL_ADDR) {
-			g_cec_context.physical_address = topology.physical_address;
-		} else {
-			g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
-		}
-		g_cec_context.logical_address = RPI_CEC_DEVICE_TYPE;
-		g_cec_context.has_logical_address = true;
-		CEC_LOG_INFO("Logical address: %d, Physical address: 0x%04x",
-				g_cec_context.logical_address, g_cec_context.physical_address);
-	} else {
-		CEC_LOG_WARN("Failed to get topology: %d, setting to default.", ret);
-		g_cec_context.physical_address = RPI_CEC_UNKNOWN_PHYSICAL_ADDR;
-		g_cec_context.logical_address = RPI_CEC_UNREGISTERED_ADDR;
-		g_cec_context.has_logical_address = false;
-	}
+	// Physical address is managed by the VideoCore firmware
+	// For a source device, we use the default physical address
+	g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
+	g_cec_context.logical_address = RPI_CEC_DEVICE_TYPE;
+	g_cec_context.has_logical_address = true;
+
+	CEC_LOG_INFO("Logical address: %d, Physical address: 0x%04x",
+			g_cec_context.logical_address, g_cec_context.physical_address);
 
 	g_cec_context.handle = cec_generate_handle();
 	g_cec_context.initialized = true;
