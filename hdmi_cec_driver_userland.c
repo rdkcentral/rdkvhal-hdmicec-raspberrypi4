@@ -48,7 +48,6 @@
 // Userland includes
 #include "bcm_host.h"
 #include "interface/vchi/vchi.h"
-#include "interface/vmcs_host/vc_vchi_cecservice.h"
 #include "interface/vmcs_host/vc_cecservice.h"
 
 #include "hdmi_cec_driver.h"
