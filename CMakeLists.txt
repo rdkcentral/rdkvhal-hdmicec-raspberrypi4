@@ -68,47 +68,8 @@ target_compile_definitions(${LIBNAME} PRIVATE
 # Link required libraries
 if(USE_USERLAND_CEC)
     # Find userland library paths
-    find_path(USERLAND_INCLUDE_DIR interface/vchi/vchi.h
-        PATHS
-            /opt/vc/include
-            /usr/include
-        NO_DEFAULT_PATH
-    )
-
-    find_library(BCM_HOST_LIB bcm_host
-        PATHS
-            /opt/vc/lib
-            /usr/lib
-        NO_DEFAULT_PATH
-    )
-
-    find_library(VCHIQ_ARM_LIB vchiq_arm
-        PATHS
-            /opt/vc/lib
-            /usr/lib
-        NO_DEFAULT_PATH
-    )
-
-    find_library(VCOS_LIB vcos
-        PATHS
-            /opt/vc/lib
-            /usr/lib
-        NO_DEFAULT_PATH
-    )
-
-    if(NOT USERLAND_INCLUDE_DIR OR NOT BCM_HOST_LIB)
-        message(FATAL_ERROR "Userland libraries not found. Install raspberrypi-userland package or disable USE_USERLAND_CEC")
-    endif()
-
-    target_include_directories(${LIBNAME} PRIVATE ${USERLAND_INCLUDE_DIR})
-    target_link_libraries(${LIBNAME} PRIVATE
-        pthread
-        ${BCM_HOST_LIB}
-        ${VCHIQ_ARM_LIB}
-        ${VCOS_LIB}
-    )
-
-    message(STATUS "Using userland libraries from: ${USERLAND_INCLUDE_DIR}")
+    include_directories(/usr/include/interface/vmcs_host/linux)
+    target_link_libraries(${LIBNAME} vchostif vchiq_arm vcos pthread)
 else()
     # Kernel-based implementation only needs pthread
     target_link_libraries(${LIBNAME} PRIVATE pthread)
