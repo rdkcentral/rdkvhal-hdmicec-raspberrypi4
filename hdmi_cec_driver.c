@@ -673,9 +673,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 
 			// Check if logical address is valid (0-14) or unregistered (15)
 			// CEC_LOG_ADDR_UNREGISTERED is typically 0x0F (15)
-			if (g_cec_context.logical_address == CEC_LOG_ADDR_UNREGISTERED ||
-			    g_cec_context.logical_address < 0 ||
-			    g_cec_context.logical_address > 15) {
+			if (g_cec_context.logical_address == CEC_LOG_ADDR_UNREGISTERED || g_cec_context.logical_address > 15) {
 				CEC_LOG_ERROR("Invalid logical address: %d (0x%02X) - CEC discovery failed",
 							 g_cec_context.logical_address, g_cec_context.logical_address);
 				CEC_LOG_ERROR("Possible causes: No CEC-enabled display connected, CEC disabled on TV, or HDMI cable doesn't support CEC");
@@ -757,13 +755,16 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	CEC_LOG_DEBUG("Stopping RX thread");
 	g_cec_context.running = false;
 	pthread_t thread_to_join = g_cec_context.rx_thread;
+	bool thread_was_created = g_cec_context.thread_created;
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	// Wait for thread to finish with timeout (Note: pthread_timedjoin_np is GNU/Linux specific)
-	if (thread_to_join) {
+	if (thread_was_created && thread_to_join) {
 		struct timespec ts;
 		int join_result;
 
+#ifdef __linux__
+		// Use timed join on Linux/GNU systems
 		if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
 			ts.tv_sec += THREAD_JOIN_TIMEOUT_SEC;
 			join_result = pthread_timedjoin_np(thread_to_join, NULL, &ts);
@@ -783,6 +784,11 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 			// clock_gettime failed, use regular join
 			pthread_join(thread_to_join, NULL);
 		}
+#else
+		// Portable fallback: use regular pthread_join (blocking)
+		CEC_LOG_DEBUG("Using portable pthread_join (no timeout)");
+		pthread_join(thread_to_join, NULL);
+#endif
 	}
 
 	pthread_mutex_lock(&g_cec_context.mutex);
@@ -1183,6 +1189,7 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		// The thread will exit when it sees running = false
 		if (thread_was_created) {
 			struct timespec timeout_ts;
+#ifdef __linux__
 			if (clock_gettime(CLOCK_REALTIME, &timeout_ts) == 0) {
 				timeout_ts.tv_sec += 2; // 2 second timeout
 				// Use timed join with short timeout; if it fails, thread will be abandoned
@@ -1194,6 +1201,10 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 				// Fallback to regular join with no timeout
 				pthread_join(thread_to_join, NULL);
 			}
+#else
+			// Portable fallback: use regular pthread_join
+			pthread_join(thread_to_join, NULL);
+#endif
 		}
 
 		// Close device file descriptor
