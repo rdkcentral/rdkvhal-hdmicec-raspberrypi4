@@ -60,20 +60,14 @@
 #endif
 
 #define CEC_MAX_MSG_SIZE 16
-#define THREAD_JOIN_TIMEOUT_SEC 5
 
-// Debug logging configuration
-#define CEC_LOG_MAX_SIZE (4 * 1024 * 1024)
 #define CEC_LOG_DIR "/opt/logs"
 #define CEC_LOG_FILE_DEFAULT CEC_LOG_DIR "/cechal_userland.log"
-#define CEC_LOG_FILE_SUFFIX ".old"
-#define CEC_TIMESTAMP_FALLBACK "1970-01-01 00:00:00.000"
+#define CEC_TIMESTAMP_FALLBACK "INVALID_TIMESTAMP"
 #define CEC_TIMESTAMP_SIZE 64
-#define CEC_LOG_PATH_MAX 256
 
 // Raspberry Pi CEC Configuration
 #define RPI_CEC_VENDOR_ID 0x00BC44
-#define RPI_CEC_OSD_NAME "Raspberry Pi"
 #define RPI_CEC_UNREGISTERED_ADDR 0x0F
 
 #define RPI_CEC_DEFAULT_PHYSICAL_ADDR 0x1000
@@ -100,8 +94,6 @@ typedef struct {
 	int handle;
 	bool initialized;
 	bool running;
-	bool thread_created;
-	pthread_t rx_thread;
 	pthread_mutex_t mutex;
 	HdmiCecRxCallback_t rx_callback;
 	void *rx_callback_data;
@@ -247,8 +239,6 @@ static cec_context_t g_cec_context = {
 	.handle = 0,
 	.initialized = false,
 	.running = false,
-	.thread_created = false,
-	.rx_thread = 0,
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.rx_callback = NULL,
 	.rx_callback_data = NULL,
@@ -340,7 +330,6 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	ret = vchi_connect(NULL, 0, g_cec_context.vchi_instance);
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to connect VCHI: %d", ret);
-		vchi_disconnect(g_cec_context.vchi_instance);
 		g_cec_context.vchi_instance = NULL;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
@@ -355,9 +344,12 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	CEC_LOG_DEBUG("Setting CEC device type %u and vendor ID 0x%06x", RPI_CEC_DEVICE_TYPE, RPI_CEC_VENDOR_ID);
 	ret = vc_cec_set_logical_address(RPI_CEC_DEVICE_TYPE, CEC_DeviceType_Playback, RPI_CEC_VENDOR_ID);
 	if (ret != 0) {
-		CEC_LOG_WARN("Failed to set logical address: %d", ret);
+		CEC_LOG_ERROR("Failed to set logical address: %d", ret);
+		// Clean up resources before returning error
+		vc_cec_register_callback(NULL, NULL);
+		vc_vchi_cec_stop();
+		g_cec_context.vchi_instance = NULL;
 		pthread_mutex_unlock(&g_cec_context.mutex);
-
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
@@ -416,6 +408,8 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	vc_cec_register_callback(NULL, NULL);
 	vc_vchi_cec_stop();
 	vchi_disconnect(g_cec_context.vchi_instance);
+	g_cec_context.vchi_instance = NULL;
+	g_cec_context.vchi_connection = NULL;
 	// Don't call bcm_host_deinit() - DeviceSettings HAL owns the bcm_host lifecycle
 
 	g_cec_context.handle = 0;
@@ -636,14 +630,20 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 
 	uint8_t follower = buf[0] & 0x0F;
 	// vc_cec_send_message expects: follower, payload (opcode+params), length, is_reply
-	uint8_t *payload = (len > 1) ? (uint8_t*)&buf[1] : NULL;
 	uint32_t payload_len = (len > 1) ? (len - 1) : 0;
-
-	if (vc_cec_send_message(follower, payload, payload_len, VC_FALSE)) {
-		CEC_LOG_ERROR("Failed to send CEC message asynchronously");
-		return HDMI_CEC_IO_SENT_FAILED;
+	if (payload_len > 0) {
+		uint8_t payload_buf[CEC_MAX_MSG_SIZE - 1];
+		memcpy(payload_buf, &buf[1], payload_len);
+		if (vc_cec_send_message(follower, payload_buf, payload_len, VC_FALSE)) {
+			CEC_LOG_ERROR("Failed to send CEC message asynchronously");
+			return HDMI_CEC_IO_SENT_FAILED;
+		}
+	} else {
+		if (vc_cec_send_message(follower, NULL, 0, VC_FALSE)) {
+			CEC_LOG_ERROR("Failed to send CEC message asynchronously");
+			return HDMI_CEC_IO_SENT_FAILED;
+		}
 	}
-
 	return HDMI_CEC_IO_SUCCESS;
 }
 
@@ -663,6 +663,8 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		vc_cec_register_callback(NULL, NULL);
 		vc_vchi_cec_stop();
 		vchi_disconnect(g_cec_context.vchi_instance);
+		g_cec_context.vchi_instance = NULL;
+		g_cec_context.vchi_connection = NULL;
 		// Don't call bcm_host_deinit() - DeviceSettings HAL owns the bcm_host lifecycle
 		g_cec_context.initialized = false;
 	}
