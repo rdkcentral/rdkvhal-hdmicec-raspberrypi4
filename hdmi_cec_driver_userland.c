@@ -254,10 +254,12 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 		uint32_t msg_len = param1;
 
 		if (msg_len > 0 && msg_len <= CEC_MAX_MSG_SIZE) {
-			uint32_t words[3];
+			// Need 4 words to hold CEC_MAX_MSG_SIZE (16 bytes)
+			uint32_t words[4];
 			words[0] = param2;
 			words[1] = param3;
 			words[2] = param4;
+			words[3] = 0; // Initialize for safety
 			for (uint32_t i = 0; i < msg_len; ++i) {
 				uint32_t word_index = i / 4;
 				uint32_t byte_shift = (i % 4U) * 8U;
@@ -274,6 +276,9 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 			pthread_mutex_unlock(&ctx->mutex);
 
 			if (should_call) {
+				// IMPORTANT: Callback receives a pointer to a stack buffer.
+				// The callback must process or copy the data immediately;
+				// storing the pointer for asynchronous use will cause undefined behavior.
 				rx_callback(callback_handle, rx_callback_data, buf, msg_len);
 			}
 		}
@@ -316,6 +321,9 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	// Skip bcm_host_init() - DeviceSettings HAL already initializes it
 	// bcm_host_init() can only be called once per system and causes conflicts
 	// if called from multiple processes/libraries
+	// WARNING: This creates a dependency on external initialization.
+	// If used outside of RDK/DeviceSettings context, bcm_host_init() must be
+	// called externally before using this HAL.
 
 	CEC_LOG_DEBUG("Initializing VCHI");
 	ret = vchi_initialise(&g_cec_context.vchi_instance);
@@ -354,8 +362,17 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	}
 
 	// Physical address is managed by the VideoCore firmware
-	// For a source device, we use the default physical address
-	g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
+	// Query actual physical address from firmware
+	uint16_t phys_addr;
+	if (vc_cec_get_physical_address(&phys_addr) == 0) {
+		g_cec_context.physical_address = phys_addr;
+		CEC_LOG_DEBUG("Retrieved physical address from firmware: 0x%04x", g_cec_context.physical_address);
+	} else {
+		// Fall back to default if query fails
+		g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
+		CEC_LOG_WARN("Failed to get physical address from firmware, using default: 0x%04x",
+		             g_cec_context.physical_address);
+	}
 	g_cec_context.logical_address = RPI_CEC_DEVICE_TYPE;
 	g_cec_context.has_logical_address = true;
 
@@ -572,8 +589,7 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
-	pthread_mutex_unlock(&g_cec_context.mutex);
-
+	// Keep mutex held during send to prevent context deinitialization
 	uint8_t follower = buf[0] & 0x0F;
 	uint8_t payload_buf[CEC_MAX_MSG_SIZE - 1];
 	uint8_t *payload = NULL;
@@ -585,6 +601,7 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 	}
 
 	int32_t ret = vc_cec_send_message(follower, payload, payload_len, VC_TRUE);
+	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (ret == 0) {
 		*result = HDMI_CEC_IO_SENT_AND_ACKD;
@@ -617,23 +634,27 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
+	// Keep mutex held during send to prevent context deinitialization
+	// vc_cec_send_message expects: follower, payload (opcode+params), length, is_reply
+	uint8_t follower = buf[0] & 0x0F;
+	uint8_t payload_buf[CEC_MAX_MSG_SIZE - 1];
+	uint32_t payload_len = (len > 1) ? (len - 1) : 0;
+	int32_t ret;
+
+	if (payload_len > 0) {
+		memcpy(payload_buf, &buf[1], payload_len);
+		// Note: vc_cec_send_message copies the buffer internally, so it's safe
+		// for payload_buf to go out of scope after this call
+		ret = vc_cec_send_message(follower, payload_buf, payload_len, VC_FALSE);
+	} else {
+		ret = vc_cec_send_message(follower, NULL, 0, VC_FALSE);
+	}
+
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
-	uint8_t follower = buf[0] & 0x0F;
-	// vc_cec_send_message expects: follower, payload (opcode+params), length, is_reply
-	uint32_t payload_len = (len > 1) ? (len - 1) : 0;
-	if (payload_len > 0) {
-		uint8_t payload_buf[CEC_MAX_MSG_SIZE - 1];
-		memcpy(payload_buf, &buf[1], payload_len);
-		if (vc_cec_send_message(follower, payload_buf, payload_len, VC_FALSE)) {
-			CEC_LOG_ERROR("Failed to send CEC message asynchronously");
-			return HDMI_CEC_IO_SENT_FAILED;
-		}
-	} else {
-		if (vc_cec_send_message(follower, NULL, 0, VC_FALSE)) {
-			CEC_LOG_ERROR("Failed to send CEC message asynchronously");
-			return HDMI_CEC_IO_SENT_FAILED;
-		}
+	if (ret != 0) {
+		CEC_LOG_ERROR("Failed to send CEC message asynchronously");
+		return HDMI_CEC_IO_SENT_FAILED;
 	}
 	return HDMI_CEC_IO_SUCCESS;
 }
@@ -646,7 +667,14 @@ static void __attribute__((constructor)) cec_driver_init(void)
 
 static void __attribute__((destructor)) cec_driver_fini(void)
 {
-	int lock_result = pthread_mutex_trylock(&g_cec_context.mutex);
+	// Try to acquire mutex with timeout using trylock in a loop
+	int lock_attempts = 0;
+	int lock_result;
+	while ((lock_result = pthread_mutex_trylock(&g_cec_context.mutex)) != 0 && lock_attempts < 100) {
+		usleep(10000); // 10ms
+		lock_attempts++;
+	}
+
 	if (lock_result == 0) {
 		if (g_cec_context.initialized) {
 			CEC_LOG_WARN("CEC device still open during shutdown");
@@ -660,7 +688,12 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 			g_cec_context.initialized = false;
 		}
 		pthread_mutex_unlock(&g_cec_context.mutex);
+	} else {
+		// If we still can't get the lock after retries, log a warning
+		// The CEC resources may leak, but it's safer than deadlocking or corrupting state
+		fprintf(stderr, "CEC HAL: Warning - could not acquire mutex during shutdown, resources may leak\n");
 	}
-	// Always close log, even if we couldn't acquire mutex
+
+	// Always close log
 	cec_log_close();
 }
