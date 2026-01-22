@@ -158,13 +158,11 @@ static void cec_log_init_impl(void)
 	}
 
 	const char *log_file_path = log_file_env ? log_file_env : CEC_LOG_FILE_DEFAULT;
-	struct stat st;
-	if (stat(CEC_LOG_DIR, &st) != 0 && errno == ENOENT) {
-		if (mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0 && errno != EEXIST) {
-			pthread_mutex_unlock(&g_log_mutex);
-			fprintf(stderr, "CEC HAL: Failed to create log directory '%s': %s\n", CEC_LOG_DIR, strerror(errno));
-			return;
-		}
+	// Create log directory if it doesn't exist (handle both success and EEXIST)
+	if (mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0 && errno != EEXIST) {
+		pthread_mutex_unlock(&g_log_mutex);
+		fprintf(stderr, "CEC HAL: Failed to create log directory '%s': %s\n", CEC_LOG_DIR, strerror(errno));
+		return;
 	}
 
 	g_log_file = fopen(log_file_path, "a");
@@ -245,6 +243,10 @@ static cec_context_t g_cec_context = {
 
 static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32_t param1, uint32_t param2, uint32_t param3, uint32_t param4)
 {
+	if (callback_data == NULL) {
+		return;
+	}
+
 	cec_context_t *ctx = (cec_context_t *)callback_data;
 
 	if (reason == VC_CEC_RX) {
@@ -345,6 +347,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 		// Clean up resources before returning error
 		vc_cec_register_callback(NULL, NULL);
 		vc_vchi_cec_stop();
+		vchi_disconnect(g_cec_context.vchi_instance);
 		g_cec_context.vchi_instance = NULL;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
@@ -515,6 +518,7 @@ HDMI_CEC_STATUS HdmiCecSetRxCallback(int handle, HdmiCecRxCallback_t callback, v
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
+	// NULL callback is valid for unregistering the receive callback
 	g_cec_context.rx_callback = callback;
 	g_cec_context.rx_callback_data = data;
 
@@ -536,6 +540,7 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t callback, v
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
+	// NULL callback is valid for unregistering the transmit callback
 	g_cec_context.tx_callback = callback;
 	g_cec_context.tx_callback_data = data;
 
