@@ -62,6 +62,7 @@
 #define RPI_CEC_VENDOR_ID 0x00BC44
 #define RPI_CEC_UNREGISTERED_ADDR 0x0F
 
+#define RPI_CEC_INVALID_PHYSICAL_ADDR 0xFFFF
 #define RPI_CEC_DEFAULT_PHYSICAL_ADDR 0x1000
 #define RPI_CEC_DEVICE_TYPE 4 // STB/Playback Device 1
 
@@ -237,7 +238,7 @@ static cec_context_t g_cec_context = {
 	.tx_callback = NULL,
 	.tx_callback_data = NULL,
 	.logical_address = RPI_CEC_UNREGISTERED_ADDR,
-	.physical_address = 0xFFFF,
+	.physical_address = RPI_CEC_INVALID_PHYSICAL_ADDR,
 	.has_logical_address = false
 };
 
@@ -349,34 +350,33 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	CEC_LOG_DEBUG("Registering CEC callback");
 	vc_cec_register_callback(cec_rx_callback_handler, &g_cec_context);
 
-	CEC_LOG_DEBUG("Setting CEC device type %u and vendor ID 0x%06x", RPI_CEC_DEVICE_TYPE, RPI_CEC_VENDOR_ID);
-	ret = vc_cec_set_logical_address(RPI_CEC_DEVICE_TYPE, CEC_DeviceType_Playback, RPI_CEC_VENDOR_ID);
-	if (ret != 0) {
-		CEC_LOG_ERROR("Failed to set logical address: %d", ret);
-		// Clean up resources before returning error
-		vc_cec_register_callback(NULL, NULL);
-		vc_vchi_cec_stop();
-		vchi_disconnect(g_cec_context.vchi_instance);
-		g_cec_context.vchi_instance = NULL;
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_GENERAL_ERROR;
-	}
-
 	// Physical address is managed by the VideoCore firmware
-	// Query actual physical address from firmware
 	uint16_t phys_addr;
 	if (vc_cec_get_physical_address(&phys_addr) == 0) {
 		g_cec_context.physical_address = phys_addr;
 		CEC_LOG_DEBUG("Retrieved physical address from firmware: 0x%04x", g_cec_context.physical_address);
+		if (phys_addr == RPI_CEC_INVALID_PHYSICAL_ADDR) {
+			CEC_LOG_INFO("No HDMI sink connected (physical address = 0x%04x) - HAL opened in disconnected state", RPI_CEC_INVALID_PHYSICAL_ADDR);
+		}
 	} else {
-		// Fall back to default if query fails
-		g_cec_context.physical_address = RPI_CEC_DEFAULT_PHYSICAL_ADDR;
-		CEC_LOG_WARN("Failed to get physical address from firmware, using default: 0x%04x",
-		             g_cec_context.physical_address);
+		// Fall back to RPI_CEC_INVALID_PHYSICAL_ADDR if query fails (indicates disconnected state)
+		g_cec_context.physical_address = RPI_CEC_INVALID_PHYSICAL_ADDR;
+		CEC_LOG_WARN("Get physical address failed, assuming disconnected (0x%04x)", RPI_CEC_INVALID_PHYSICAL_ADDR);
 	}
-	g_cec_context.logical_address = RPI_CEC_DEVICE_TYPE;
-	g_cec_context.has_logical_address = true;
 
+	// Set vendor ID for this device
+	// Note: Logical address allocation happens automatically by the CEC firmware
+	// after vc_vchi_cec_init(). The allocated address will be provided via
+	// VC_CEC_LOGICAL_ADDR callback (not implemented in this basic HAL).
+	// For source devices, the typical logical address is 4 (Playback Device 1).
+	vc_cec_set_vendor_id(RPI_CEC_VENDOR_ID);
+
+	// Set the logical address to the default playback device address
+	// The firmware will have automatically allocated this during initialization
+	// Note: If HDMI is disconnected (phys_addr = RPI_CEC_INVALID_PHYSICAL_ADDR), the logical address
+	// may be unregistered (0x0F), but the HAL still opens successfully
+	g_cec_context.logical_address = RPI_CEC_DEVICE_TYPE;
+	g_cec_context.has_logical_address = (phys_addr != RPI_CEC_INVALID_PHYSICAL_ADDR);
 	CEC_LOG_INFO("Logical address: %d, Physical address: 0x%04x",
 			g_cec_context.logical_address, g_cec_context.physical_address);
 
@@ -431,7 +431,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	g_cec_context.tx_callback_data = NULL;
 	g_cec_context.logical_address = RPI_CEC_UNREGISTERED_ADDR;
 	g_cec_context.has_logical_address = false;
-	g_cec_context.physical_address = 0xFFFF;
+	g_cec_context.physical_address = RPI_CEC_INVALID_PHYSICAL_ADDR;
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
@@ -467,6 +467,13 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int* physicalAddr
 
 HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
+	// Validate arguments first, even before checking if operation is supported
+	// This ensures consistent error handling across source and sink devices
+	if (logicalAddresses < 0 || logicalAddresses > RPI_CEC_UNREGISTERED_ADDR) {
+		CEC_LOG_ERROR("Invalid logical address: %d", logicalAddresses);
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -486,6 +493,13 @@ HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
+	// Validate arguments first, even before checking if operation is supported
+	// This ensures consistent error handling across source and sink devices
+	if (logicalAddresses < 0 || logicalAddresses > RPI_CEC_UNREGISTERED_ADDR) {
+		CEC_LOG_ERROR("Invalid logical address: %d", logicalAddresses);
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -575,6 +589,17 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 {
 	CEC_LOG_DEBUG("HdmiCecTx: handle=%d, len=%d", handle, len);
 
+	// Validate arguments first for consistent error reporting
+	if (buf == NULL || result == NULL) {
+		CEC_LOG_ERROR("Invalid arguments: buf or result is NULL");
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
+	if (len <= 0 || len > CEC_MAX_MSG_SIZE) {
+		CEC_LOG_ERROR("Invalid length: %d (must be > 0 and <= %d)", len, CEC_MAX_MSG_SIZE);
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -587,12 +612,6 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 		CEC_LOG_ERROR("Invalid handle: %d", handle);
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_INVALID_HANDLE;
-	}
-
-	if (buf == NULL || len <= 0 || len > CEC_MAX_MSG_SIZE || result == NULL) {
-		CEC_LOG_ERROR("Invalid arguments");
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
 	// Keep mutex held during send to prevent context deinitialization
@@ -623,6 +642,17 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 
 HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 {
+	// Validate arguments first for consistent error reporting
+	if (buf == NULL) {
+		CEC_LOG_ERROR("Invalid arguments: buf is NULL");
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
+	if (len <= 0 || len > CEC_MAX_MSG_SIZE) {
+		CEC_LOG_ERROR("Invalid length: %d (must be > 0 and <= %d)", len, CEC_MAX_MSG_SIZE);
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -633,11 +663,6 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	if (handle == 0 || handle != g_cec_context.handle) {
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_INVALID_HANDLE;
-	}
-
-	if (buf == NULL || len <= 0 || len > CEC_MAX_MSG_SIZE) {
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
 	// Keep mutex held during send to prevent context deinitialization
