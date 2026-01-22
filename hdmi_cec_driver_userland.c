@@ -65,6 +65,9 @@
 #define RPI_CEC_DEFAULT_PHYSICAL_ADDR 0x1000
 #define RPI_CEC_DEVICE_TYPE 4 // STB/Playback Device 1
 
+// Handle generation mask to ensure positive integer values (clear sign bit)
+#define HANDLE_SIGN_BIT_MASK 0x7FFFFFFF
+
 // Log levels
 #define CEC_LOG_LEVEL_ERROR   0
 #define CEC_LOG_LEVEL_WARN    1
@@ -218,10 +221,10 @@ static int cec_generate_handle(void)
 {
 	struct timespec ts;
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-		int handle = (int)((ts.tv_sec ^ ts.tv_nsec ^ getpid()) & 0x7FFFFFFF);
+		int handle = (int)((ts.tv_sec ^ ts.tv_nsec ^ getpid()) & HANDLE_SIGN_BIT_MASK);
 		return handle ? handle : 1;
 	}
-	return (int)(time(NULL) & 0x7FFFFFFF) ?: 1;
+	return (int)(time(NULL) & HANDLE_SIGN_BIT_MASK) ?: 1;
 }
 
 static cec_context_t g_cec_context = {
