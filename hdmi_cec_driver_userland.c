@@ -330,6 +330,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to initialize VCHI: %d", ret);
 		pthread_mutex_unlock(&g_cec_context.mutex);
+		g_cec_context.vchi_instance = NULL;
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
@@ -408,9 +409,14 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
+	// Set flags to prevent new callbacks from proceeding
 	g_cec_context.running = false;
 	g_cec_context.initialized = false;
 
+	// Keep mutex held during entire cleanup to prevent race with callbacks
+	// Callbacks check running/initialized flags under mutex protection,
+	// so holding the mutex ensures no callback can proceed past those checks
+	// while we're tearing down resources
 	vc_cec_register_callback(NULL, NULL);
 	vc_vchi_cec_stop();
 	vchi_disconnect(g_cec_context.vchi_instance);
@@ -667,13 +673,17 @@ static void __attribute__((constructor)) cec_driver_init(void)
 
 static void __attribute__((destructor)) cec_driver_fini(void)
 {
-	// Try to acquire mutex with timeout using trylock in a loop
-	int lock_attempts = 0;
-	int lock_result;
-	while ((lock_result = pthread_mutex_trylock(&g_cec_context.mutex)) != 0 && lock_attempts < 100) {
-		usleep(10000); // 10ms
-		lock_attempts++;
+	// Use pthread_mutex_timedlock for efficient blocking wait with timeout
+	struct timespec timeout;
+	if (clock_gettime(CLOCK_REALTIME, &timeout) == 0) {
+		timeout.tv_sec += 1; // 1 second timeout
+	} else {
+		// Fallback if clock_gettime fails
+		timeout.tv_sec = time(NULL) + 1;
+		timeout.tv_nsec = 0;
 	}
+
+	int lock_result = pthread_mutex_timedlock(&g_cec_context.mutex, &timeout);
 
 	if (lock_result == 0) {
 		if (g_cec_context.initialized) {
