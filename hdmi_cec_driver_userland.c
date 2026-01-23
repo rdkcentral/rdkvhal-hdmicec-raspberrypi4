@@ -26,12 +26,10 @@
  */
 
 #include <string.h>
-#include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
@@ -55,8 +53,6 @@
 
 #define CEC_MAX_MSG_SIZE 16
 
-#define CEC_LOG_DIR "/opt/logs"
-#define CEC_LOG_FILE_DEFAULT CEC_LOG_DIR "/cechal_userland.log"
 #define CEC_TIMESTAMP_FALLBACK "_TIMESTAMP_UNAVAILABLE_"
 #define CEC_TIMESTAMP_SIZE 64
 
@@ -71,19 +67,17 @@
 #define CEC_LOG_LEVEL_TRACE   4
 
 #define CEC_LOG(level, ...) cec_log(level, __func__, __LINE__, __VA_ARGS__)
-#define CEC_LOG_ERROR(...) CEC_LOG(CEC_LOG_LEVEL_ERROR, __VA_ARGS__)
-#define CEC_LOG_WARN(...)  CEC_LOG(CEC_LOG_LEVEL_WARN, __VA_ARGS__)
-#define CEC_LOG_INFO(...)  CEC_LOG(CEC_LOG_LEVEL_INFO, __VA_ARGS__)
-#define CEC_LOG_DEBUG(...) CEC_LOG(CEC_LOG_LEVEL_DEBUG, __VA_ARGS__)
-#define CEC_LOG_TRACE(...) CEC_LOG(CEC_LOG_LEVEL_TRACE, __VA_ARGS__)
+#define CEC_LOG_ERROR(fmt, ...) CEC_LOG(CEC_LOG_LEVEL_ERROR, "RPICECHAL: " fmt, ##__VA_ARGS__)
+#define CEC_LOG_WARN(fmt, ...)  CEC_LOG(CEC_LOG_LEVEL_WARN,  "RPICECHAL: " fmt, ##__VA_ARGS__)
+#define CEC_LOG_INFO(fmt, ...)  CEC_LOG(CEC_LOG_LEVEL_INFO,  "RPICECHAL: " fmt, ##__VA_ARGS__)
+#define CEC_LOG_DEBUG(fmt, ...) CEC_LOG(CEC_LOG_LEVEL_DEBUG, "RPICECHAL: " fmt, ##__VA_ARGS__)
+#define CEC_LOG_TRACE(fmt, ...) CEC_LOG(CEC_LOG_LEVEL_TRACE, "RPICECHAL: " fmt, ##__VA_ARGS__)
 
 // Timing constants for cleanup and callback synchronization
 #define CEC_CALLBACK_WAIT_MS 10
 #define CEC_CALLBACK_WAIT_US (CEC_CALLBACK_WAIT_MS * 1000)
 #define CEC_CLOSE_MAX_WAIT_ITERATIONS 100
 #define CEC_DESTRUCTOR_MAX_WAIT_ITERATIONS 50
-#define CEC_DESTRUCTOR_FORCE_WAIT_MS 50
-#define CEC_DESTRUCTOR_FORCE_WAIT_US (CEC_DESTRUCTOR_FORCE_WAIT_MS * 1000)
 #define CEC_MUTEX_TIMEOUT_SEC 1
 #define CEC_WORDS_PER_MESSAGE 4
 #define CEC_BITS_PER_BYTE 8
@@ -108,7 +102,7 @@ typedef struct {
 static FILE *g_log_file = NULL;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t g_log_init_once = PTHREAD_ONCE_INIT;
-static int g_log_level = CEC_LOG_LEVEL_TRACE;
+static int g_log_level = CEC_LOG_LEVEL_WARN;
 
 static void cec_get_timestamp(char *buffer, size_t size)
 {
@@ -136,14 +130,20 @@ static const char* cec_get_log_level_str(int level)
 {
 	switch(level) {
 		case CEC_LOG_LEVEL_ERROR: return "ERROR";
-		case CEC_LOG_LEVEL_WARN:  return "WARN ";
-		case CEC_LOG_LEVEL_INFO:  return "INFO ";
+		case CEC_LOG_LEVEL_WARN:  return "WARN";
+		case CEC_LOG_LEVEL_INFO:  return "INFO";
 		case CEC_LOG_LEVEL_DEBUG: return "DEBUG";
 		case CEC_LOG_LEVEL_TRACE: return "TRACE";
 		default: return "UNKNOWN";
 	}
 }
 
+/**
+ * Initialize logging system based on environment variables.
+ * CEC_HAL_LOG_LEVEL: Set log level (ERROR, WARN, INFO, DEBUG, TRACE)
+ * CEC_HAL_LOG_FILE: Set log file path (if not set, logs to stdout).
+ * User is responsible for ensuring directory exists.
+ */
 static void cec_log_init_impl(void)
 {
 	pthread_mutex_lock(&g_log_mutex);
@@ -159,19 +159,27 @@ static void cec_log_init_impl(void)
 		else if (strcmp(log_level_env, "TRACE") == 0) g_log_level = CEC_LOG_LEVEL_TRACE;
 	}
 
-	const char *log_file_path = log_file_env ? log_file_env : CEC_LOG_FILE_DEFAULT;
-	struct stat st;
-	if (stat(CEC_LOG_DIR, &st) != 0 && errno == ENOENT) {
-		mkdir(CEC_LOG_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-	}
-
-	g_log_file = fopen(log_file_path, "a");
-	if (g_log_file != NULL) {
-		setvbuf(g_log_file, NULL, _IOLBF, 0);
+	if (log_file_env != NULL) {
+		// Log to file specified in environment variable
+		// User is responsible for creating the directory
+		g_log_file = fopen(log_file_env, "a");
+		if (g_log_file != NULL) {
+			setvbuf(g_log_file, NULL, _IOLBF, 0);
+			char timestamp[CEC_TIMESTAMP_SIZE];
+			cec_get_timestamp(timestamp, sizeof(timestamp));
+			fprintf(g_log_file, "RPICECHAL: Log Started (USERLAND): %s (Level: %s)\n",
+					timestamp, cec_get_log_level_str(g_log_level));
+		} else {
+			fprintf(stdout, "RPICECHAL: Failed to open log file: %s\n", log_file_env);
+		}
+	} else {
+		// Log to stdout when CEC_HAL_LOG_FILE is not set
+		g_log_file = stdout;
 		char timestamp[CEC_TIMESTAMP_SIZE];
 		cec_get_timestamp(timestamp, sizeof(timestamp));
-		fprintf(g_log_file, "CEC HAL Log Started (USERLAND): %s (Level: %s)\n",
+		fprintf(g_log_file, "RPICECHAL: Log Started (USERLAND): %s (Level: %s)\n",
 				timestamp, cec_get_log_level_str(g_log_level));
+		fflush(g_log_file);
 	}
 
 	pthread_mutex_unlock(&g_log_mutex);
@@ -188,8 +196,12 @@ static void cec_log_close(void)
 	if (g_log_file != NULL) {
 		char timestamp[CEC_TIMESTAMP_SIZE];
 		cec_get_timestamp(timestamp, sizeof(timestamp));
-		fprintf(g_log_file, "CEC HAL Log Closed: %s\n", timestamp);
-		fclose(g_log_file);
+		fprintf(g_log_file, "RPICECHAL: Log Closed: %s\n", timestamp);
+		fflush(g_log_file);
+		// Only close if it's not stdout
+		if (g_log_file != stdout) {
+			fclose(g_log_file);
+		}
 		g_log_file = NULL;
 	}
 	pthread_mutex_unlock(&g_log_mutex);
@@ -251,17 +263,10 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 	cec_context_t *ctx = (cec_context_t *)callback_data;
 
 	if (reason == VC_CEC_RX) {
-		unsigned char *buf = NULL;
+		unsigned char buf[CEC_MAX_MSG_SIZE];
 		uint32_t msg_len = param1;
 
 		if (msg_len > 0 && msg_len <= CEC_MAX_MSG_SIZE) {
-			// Allocate buffer on heap to avoid stack lifetime issues
-			buf = (unsigned char *)malloc(msg_len);
-			if (buf == NULL) {
-				CEC_LOG_ERROR("Failed to allocate buffer for CEC message");
-				return;
-			}
-
 			uint32_t words[CEC_WORDS_PER_MESSAGE];
 			words[0] = param2;
 			words[1] = param3;
@@ -286,16 +291,13 @@ static void cec_rx_callback_handler(void *callback_data, uint32_t reason, uint32
 			pthread_mutex_unlock(&ctx->mutex);
 
 			if (should_call) {
-				// Buffer is heap-allocated, callback can safely store or process it
-				// Callback is responsible for freeing the buffer when done
+				// Buffer is stack-allocated and valid during callback execution
+				// Callback must copy data if it needs to store it
 				rx_callback(callback_handle, rx_callback_data, buf, msg_len);
 
 				pthread_mutex_lock(&ctx->mutex);
 				ctx->callback_active--;
 				pthread_mutex_unlock(&ctx->mutex);
-			} else {
-				// No callback to invoke, free the buffer
-				free(buf);
 			}
 		}
 	} else if (reason == VC_CEC_TX) {
@@ -380,15 +382,16 @@ HDMI_CEC_STATUS HdmiCecOpen(int* handle)
 	ret = vchi_initialise(&g_cec_context.vchi_instance);
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to initialize VCHI: %d", ret);
-		pthread_mutex_unlock(&g_cec_context.mutex);
 		g_cec_context.vchi_instance = NULL;
+		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
 	ret = vchi_connect(NULL, 0, g_cec_context.vchi_instance);
 	if (ret != 0) {
 		CEC_LOG_ERROR("Failed to connect VCHI: %d", ret);
-		// Note: Don't call vchi_disconnect on failed connection
+		// Note: vchi_instance was initialized, so it should be left as-is
+		// The context is still in uninitialized state, so no cleanup needed
 		g_cec_context.vchi_instance = NULL;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
@@ -525,14 +528,14 @@ HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
 	// For source devices, this operation is not supported
 	// Return OPERATION_NOT_SUPPORTED regardless of other conditions
-	CEC_LOG_INFO("HdmiCecAddLogicalAddress not supported for source devices");
+	CEC_LOG_WARN("HdmiCecAddLogicalAddress not supported for source devices");
 	return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
 }
 
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
 	// For source devices, this operation is not supported.
-	CEC_LOG_INFO("HdmiCecRemoveLogicalAddress not supported for source devices");
+	CEC_LOG_WARN("HdmiCecRemoveLogicalAddress not supported for source devices");
 	return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
 }
 
@@ -632,6 +635,11 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char* buf, int len, int* re
 	uint32_t payload_len = 0;
 	if (len > 1) {
 		payload_len = (uint32_t)(len - 1);
+		if (payload_len > sizeof(payload_buf)) {
+			CEC_LOG_ERROR("Payload length %u exceeds buffer size %zu", payload_len, sizeof(payload_buf));
+			pthread_mutex_unlock(&g_cec_context.mutex);
+			return HDMI_CEC_IO_INVALID_ARGUMENT;
+		}
 		memcpy(payload_buf, &buf[1], payload_len);
 		payload = payload_buf;
 	}
@@ -679,6 +687,11 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char* buf, int len)
 	int32_t ret;
 
 	if (payload_len > 0) {
+		if (payload_len > sizeof(payload_buf)) {
+			CEC_LOG_ERROR("Payload length %u exceeds buffer size %zu", payload_len, sizeof(payload_buf));
+			pthread_mutex_unlock(&g_cec_context.mutex);
+			return HDMI_CEC_IO_INVALID_ARGUMENT;
+		}
 		memcpy(payload_buf, &buf[1], payload_len);
 		// Note: vc_cec_send_message copies the buffer internally, so it's safe
 		// for payload_buf to go out of scope after this call
@@ -740,24 +753,13 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 			g_cec_context.initialized = false;
 		}
 		pthread_mutex_unlock(&g_cec_context.mutex);
+		pthread_mutex_destroy(&g_cec_context.mutex);
 	} else {
-		// Mutex acquisition timed out - perform cleanup without mutex to prevent resource leaks
-		// This is risky (potential race conditions) but better than leaking resources
-		fprintf(stderr, "CEC HAL: Warning - mutex timeout during shutdown, forcing cleanup\n");
-		if (g_cec_context.initialized) {
-			g_cec_context.running = false;
-			vc_cec_register_callback(NULL, NULL);
-			usleep(CEC_DESTRUCTOR_FORCE_WAIT_US);
-			vc_vchi_cec_stop();
-			if (g_cec_context.vchi_instance != NULL) {
-				vchi_disconnect(g_cec_context.vchi_instance);
-			}
-			g_cec_context.vchi_instance = NULL;
-			g_cec_context.vchi_connection = NULL;
-			g_cec_context.initialized = false;
-		}
+		// Mutex acquisition timed out - skip cleanup to avoid race conditions
+		fprintf(stderr, "CEC HAL: Error - mutex timeout during shutdown, skipping cleanup to prevent crashes\n");
 	}
 
-	// Always close log
+	// Always close log and destroy log mutex
 	cec_log_close();
+	pthread_mutex_destroy(&g_log_mutex);
 }
