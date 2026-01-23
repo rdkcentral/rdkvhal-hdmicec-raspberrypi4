@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # RCECHal version
-project(RCECHal VERSION 1.4.0 LANGUAGES C)
+project(RCECHal VERSION 1.3.7 LANGUAGES C)
 
 set(LIBNAME RCECHal)
 set(DEFAULT_BUILD_TYPE "Release")
@@ -11,9 +11,9 @@ message(STATUS "Building with USERLAND-based CEC implementation (experimental)")
 set(SRCS hdmi_cec_driver_userland.c)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-	message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
-	set(CMAKE_BUILD_TYPE "${DEFAULT_BUILD_TYPE}" CACHE STRING "Choose the type of build." FORCE)
-	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+    message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
+    set(CMAKE_BUILD_TYPE "${DEFAULT_BUILD_TYPE}" CACHE STRING "Choose the type of build." FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
 include(GNUInstallDirs)
