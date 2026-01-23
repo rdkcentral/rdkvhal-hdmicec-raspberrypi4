@@ -7,7 +7,7 @@ project(RCECHal VERSION 1.3.7 LANGUAGES C)
 set(LIBNAME RCECHal)
 set(DEFAULT_BUILD_TYPE "Release")
 
-message(STATUS "Building with USERLAND-based CEC implementation (experimental)")
+message(STATUS "Building with USERLAND-based CEC implementation")
 set(SRCS hdmi_cec_driver_userland.c)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
