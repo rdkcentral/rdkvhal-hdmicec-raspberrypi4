@@ -754,12 +754,14 @@ static void __attribute__((destructor)) cec_driver_fini(void)
 		}
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		pthread_mutex_destroy(&g_cec_context.mutex);
-	} else {
-		// Mutex acquisition timed out - skip cleanup to avoid race conditions
-		fprintf(stderr, "CEC HAL: Error - mutex timeout during shutdown, skipping cleanup to prevent crashes\n");
-	}
 
-	// Always close log and destroy log mutex
-	cec_log_close();
-	pthread_mutex_destroy(&g_log_mutex);
+		// Clean up logging only in orderly shutdown
+		cec_log_close();
+		pthread_mutex_destroy(&g_log_mutex);
+	} else {
+		// Mutex acquisition timed out - skip ALL cleanup to avoid undefined behavior
+		// Leak resources rather than risk crashes or corruption when destruction and rely on OS.
+		fprintf(stderr, "RPiCECHAL: Error - mutex timeout during shutdown, skipping all cleanup.\n");
+	}
 }
+
