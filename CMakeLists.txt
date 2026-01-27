@@ -1,26 +1,69 @@
 # Minimum CMake version required
 cmake_minimum_required(VERSION 3.10)
 
-# Version is matched with the version of hdmicecheader - 1.3.7.
-project(RCECHal VERSION 1.3.7 LANGUAGES C)
+# RCECHal version
+project(RCECHal VERSION 1.4.0 LANGUAGES C)
 
 set(LIBNAME RCECHal)
-set(SRCS hdmi_cec_driver.c)
 set(DEFAULT_BUILD_TYPE "Release")
 
+message(STATUS "Building with USERLAND-based CEC implementation")
+set(SRCS hdmi_cec_driver_userland.c)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-	message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
-	set(CMAKE_BUILD_TYPE "${DEFAULT_BUILD_TYPE}" CACHE STRING "Choose the type of build." FORCE)
-	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+    message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
+    set(CMAKE_BUILD_TYPE "${DEFAULT_BUILD_TYPE}" CACHE STRING "Choose the type of build." FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
 include(GNUInstallDirs)
+
+# Get git commit SHA
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT GIT_COMMIT_SHA)
+    set(GIT_COMMIT_SHA "unknown")
+endif()
+message(STATUS "Git commit SHA: ${GIT_COMMIT_SHA}")
+
+find_path(HDMI_CEC_INCLUDE_DIR hdmi_cec_driver.h
+    PATHS
+        ${CMAKE_CURRENT_SOURCE_DIR}/../rdk-halif-hdmi_cec/include
+        /usr/include
+        /usr/local/include
+    PATH_SUFFIXES ccec/drivers
+)
+
+if(NOT HDMI_CEC_INCLUDE_DIR)
+    message(STATUS "HDMI CEC header not found in system paths, using local path")
+    set(HDMI_CEC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../rdk-halif-hdmi_cec/include)
+endif()
+
+# Configurable include directory for VMCS host Linux headers
+set(VMCS_HOST_INCLUDE_DIR "/usr/include/interface/vmcs_host/linux" CACHE PATH "Path to VMCS host Linux headers")
+if(NOT EXISTS "${VMCS_HOST_INCLUDE_DIR}")
+    message(WARNING "VMCS host include directory '${VMCS_HOST_INCLUDE_DIR}' does not exist. Adjust VMCS_HOST_INCLUDE_DIR if needed.")
+endif()
 
 add_library(${LIBNAME} SHARED ${SRCS})
 
 set_target_properties(${LIBNAME} PROPERTIES
 	VERSION ${PROJECT_VERSION}
 	SOVERSION ${PROJECT_VERSION}
+)
+
+target_include_directories(${LIBNAME} PRIVATE ${HDMI_CEC_INCLUDE_DIR})
+target_include_directories(${LIBNAME} PRIVATE ${VMCS_HOST_INCLUDE_DIR})
+target_link_libraries(${LIBNAME} PRIVATE vchostif vchiq_arm vcos pthread)
+
+target_compile_definitions(${LIBNAME} PRIVATE
+    HAL_VERSION="${PROJECT_VERSION}"
+    GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
 )
 
 add_custom_target(clean-all
