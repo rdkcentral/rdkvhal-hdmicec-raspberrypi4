@@ -349,6 +349,8 @@ static void *cec_rx_thread(void *arg)
 
 		/* TX completion event (async transmit path) */
 		if (msg.tx_status != 0) {
+			/* WARNING: Lock ordering: CEC_LOG_DEBUG takes g_log_mutex before we acquire ctx->mutex.
+			 * Same deadlock risk as in RX path. Restructure to avoid holding ctx->mutex during logging. */
 			CEC_LOG_DEBUG("TX completion: tx_status=0x%02x", msg.tx_status);
 
 			pthread_mutex_lock(&ctx->mutex);
@@ -365,14 +367,27 @@ static void *cec_rx_thread(void *arg)
 				             HDMI_CEC_IO_SENT_FAILED;
 				tx_cb(cb_handle, tx_cb_data, result);
 
+				/* Callback may have invoked HdmiCecClose() from within rx_thread, which would
+				 * set deferred_cleanup and wait for callback_active to reach 0. Guard against
+				 * underflow if close timed out and reset callback_active, or if callback itself
+				 * triggered close. */
 				pthread_mutex_lock(&ctx->mutex);
-				ctx->callback_active--;
+				if (ctx->callback_active > 0) {
+					ctx->callback_active--;
+				} else {
+					CEC_LOG_WARN("callback_active already 0 after tx callback; skipping decrement");
+				}
 				pthread_mutex_unlock(&ctx->mutex);
 			}
 		}
 
 		/* Received CEC message */
 		if ((msg.rx_status & CEC_RX_STATUS_OK) && msg.len > 0) {
+			/* WARNING: Lock ordering: CEC_LOG_INFO takes g_log_mutex before we acquire ctx->mutex.
+			 * Other code paths acquire ctx->mutex before logging. Inconsistent lock order can
+			 * cause ABBA deadlock if one thread holds ctx->mutex waiting for g_log_mutex while
+			 * rx_thread holds g_log_mutex waiting for ctx->mutex. Consider restructuring to
+			 * always acquire mutexes in the same order (e.g., never log while holding ctx->mutex). */
 			CEC_LOG_INFO("Received CEC message: len=%u", (unsigned int)msg.len);
 
 			pthread_mutex_lock(&ctx->mutex);
@@ -386,8 +401,13 @@ static void *cec_rx_thread(void *arg)
 			if (should_call) {
 				rx_cb(cb_handle, rx_cb_data, msg.msg, (int)msg.len);
 
+				/* Same underflow guard as in TX callback path. */
 				pthread_mutex_lock(&ctx->mutex);
-				ctx->callback_active--;
+				if (ctx->callback_active > 0) {
+					ctx->callback_active--;
+				} else {
+					CEC_LOG_WARN("callback_active already 0 after rx callback; skipping decrement");
+				}
 				pthread_mutex_unlock(&ctx->mutex);
 			}
 		}
@@ -700,22 +720,29 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 		return HDMI_CEC_IO_SUCCESS;
 	}
 
-	/* Wait for any in-progress callbacks to complete */
+/* Wait for any in-progress callbacks to complete before tearing down FDs.
+	 * Proceeding with cleanup while callbacks are still active can close descriptors
+	 * out from under callback code (including callbacks that called HdmiCecClose itself),
+	 * causing use-after-close and inconsistent state. Previous timeout-based approach
+	 * allowed cleanup to proceed with active callbacks still in-flight, violating refcount
+	 * semantics and risking callback_active underflow. Now we wait indefinitely. */
 	pthread_mutex_lock(&g_cec_context.mutex);
 	int wait_count = 0;
-	while (g_cec_context.callback_active > 0 &&
-	       wait_count < CEC_CLOSE_MAX_WAIT_ITERATIONS) {
+	while (g_cec_context.callback_active > 0) {
+		if ((wait_count % CEC_CLOSE_MAX_WAIT_ITERATIONS) == 0) {
+			CEC_LOG_WARN("Waiting for %d active callback(s) to finish before closing",
+		             g_cec_context.callback_active);
+		}
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		usleep(CEC_CALLBACK_WAIT_US);
 		pthread_mutex_lock(&g_cec_context.mutex);
 		wait_count++;
 	}
-	if (g_cec_context.callback_active > 0) {
-		CEC_LOG_WARN("Closing with %d active callbacks still running",
-		             g_cec_context.callback_active);
-	}
+	pthread_mutex_unlock(&g_cec_context.mutex);
 
-	/* Release CEC resources */
+	/* Release CEC resources. callback_active is now guaranteed to be 0,
+	 * so no callback will access these FDs or the context structure. */
+	pthread_mutex_lock(&g_cec_context.mutex);
 	close(g_cec_context.pipe_wr);
 	close(g_cec_context.pipe_rd);
 	close(g_cec_context.fd);
@@ -733,7 +760,9 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	g_cec_context.logical_address     = CEC_LOG_ADDR_UNREGISTERED;
 	g_cec_context.has_logical_address = false;
 	g_cec_context.physical_address    = CEC_PHYS_ADDR_INVALID;
-	g_cec_context.callback_active     = 0;
+	/* Do NOT reset callback_active to 0; leave accurate refcount. If a callback
+	 * somehow completes after wait loop, its decrement will be valid and won't
+	 * cause underflow. */
 	g_cec_context.deferred_cleanup    = false;
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -1129,13 +1158,21 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	if (should_call) {
 		tx_cb(cb_handle, tx_cb_data, *result);
 		pthread_mutex_lock(&g_cec_context.mutex);
-		g_cec_context.callback_active--;
+		/* Guard against underflow: callback may have triggered HdmiCecClose(). */
+		if (g_cec_context.callback_active > 0) {
+			g_cec_context.callback_active--;
+		} else {
+			CEC_LOG_WARN("callback_active already 0 in HdmiCecTx; skipping decrement");
+		}
 		pthread_mutex_unlock(&g_cec_context.mutex);
 	}
 
-	/* Preserve the HAL contract: a successful transmit ioctl returns SUCCESS.
-	 * ACK/NACK/failure of the message delivery is reported via *result and
-	 * tx_callback; non-SUCCESS return codes are reserved for API/transport errors. */
+	/* Return value: preserve prior observable behavior for callers that check the return code.
+	 * For backward compatibility with the userland implementation, return SENT_FAILED when
+	 * the ioctl succeeds but the message delivery was not ACK'd (e.g., collision/arb-lost).
+	 * ACK/NACK outcomes are also reported via *result and tx_callback. */
+	if (*result == HDMI_CEC_IO_SENT_FAILED)
+		return HDMI_CEC_IO_SENT_FAILED;
 	return HDMI_CEC_IO_SUCCESS;
 }
 
