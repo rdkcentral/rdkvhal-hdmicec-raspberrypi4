@@ -349,10 +349,6 @@ static void *cec_rx_thread(void *arg)
 
 		/* TX completion event (async transmit path) */
 		if (msg.tx_status != 0) {
-			/* WARNING: Lock ordering: CEC_LOG_DEBUG takes g_log_mutex before we acquire ctx->mutex.
-			 * Same deadlock risk as in RX path. Restructure to avoid holding ctx->mutex during logging. */
-			CEC_LOG_DEBUG("TX completion: tx_status=0x%02x", msg.tx_status);
-
 			pthread_mutex_lock(&ctx->mutex);
 			HdmiCecTxCallback_t tx_cb  = ctx->tx_callback;
 			void *tx_cb_data           = ctx->tx_callback_data;
@@ -367,29 +363,24 @@ static void *cec_rx_thread(void *arg)
 				             HDMI_CEC_IO_SENT_FAILED;
 				tx_cb(cb_handle, tx_cb_data, result);
 
-				/* Callback may have invoked HdmiCecClose() from within rx_thread, which would
-				 * set deferred_cleanup and wait for callback_active to reach 0. Guard against
-				 * underflow if close timed out and reset callback_active, or if callback itself
-				 * triggered close. */
+				bool callback_active_underflow = false;
 				pthread_mutex_lock(&ctx->mutex);
 				if (ctx->callback_active > 0) {
 					ctx->callback_active--;
 				} else {
-					CEC_LOG_WARN("callback_active already 0 after tx callback; skipping decrement");
+					callback_active_underflow = true;
 				}
 				pthread_mutex_unlock(&ctx->mutex);
+				if (callback_active_underflow) {
+					CEC_LOG_WARN("callback_active already 0 after tx callback; skipping decrement");
+				}
 			}
+
+			CEC_LOG_DEBUG("TX completion: tx_status=0x%02x", msg.tx_status);
 		}
 
 		/* Received CEC message */
 		if ((msg.rx_status & CEC_RX_STATUS_OK) && msg.len > 0) {
-			/* WARNING: Lock ordering: CEC_LOG_INFO takes g_log_mutex before we acquire ctx->mutex.
-			 * Other code paths acquire ctx->mutex before logging. Inconsistent lock order can
-			 * cause ABBA deadlock if one thread holds ctx->mutex waiting for g_log_mutex while
-			 * rx_thread holds g_log_mutex waiting for ctx->mutex. Consider restructuring to
-			 * always acquire mutexes in the same order (e.g., never log while holding ctx->mutex). */
-			CEC_LOG_INFO("Received CEC message: len=%u", (unsigned int)msg.len);
-
 			pthread_mutex_lock(&ctx->mutex);
 			HdmiCecRxCallback_t rx_cb = ctx->rx_callback;
 			void *rx_cb_data          = ctx->rx_callback_data;
@@ -401,15 +392,20 @@ static void *cec_rx_thread(void *arg)
 			if (should_call) {
 				rx_cb(cb_handle, rx_cb_data, msg.msg, (int)msg.len);
 
-				/* Same underflow guard as in TX callback path. */
+				bool callback_active_underflow = false;
 				pthread_mutex_lock(&ctx->mutex);
 				if (ctx->callback_active > 0) {
 					ctx->callback_active--;
 				} else {
-					CEC_LOG_WARN("callback_active already 0 after rx callback; skipping decrement");
+					callback_active_underflow = true;
 				}
 				pthread_mutex_unlock(&ctx->mutex);
+				if (callback_active_underflow) {
+					CEC_LOG_WARN("callback_active already 0 after rx callback; skipping decrement");
+				}
 			}
+
+			CEC_LOG_INFO("Received CEC message: len=%u", (unsigned int)msg.len);
 		}
 	}
 
@@ -694,6 +690,9 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	/* Self-close from within rx_thread callback cannot join itself. */
 	bool close_from_rx_thread = g_cec_context.rx_thread_running &&
 	                           pthread_equal(pthread_self(), g_cec_context.rx_thread);
+	bool rx_thread_was_running = g_cec_context.rx_thread_running;
+	pthread_t rx_thread = g_cec_context.rx_thread;
+	int pipe_wr = g_cec_context.pipe_wr;
 
 	g_cec_context.running     = false;
 	g_cec_context.initialized = false;
@@ -704,12 +703,14 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	/* Signal rx_thread to exit then reap it */
-	if (g_cec_context.rx_thread_running) {
+	if (rx_thread_was_running) {
 		char byte = 1;
-		(void)write(g_cec_context.pipe_wr, &byte, 1);
+		(void)write(pipe_wr, &byte, 1);
 		if (!close_from_rx_thread) {
-			pthread_join(g_cec_context.rx_thread, NULL);
+			pthread_join(rx_thread, NULL);
+			pthread_mutex_lock(&g_cec_context.mutex);
 			g_cec_context.rx_thread_running = false;
+			pthread_mutex_unlock(&g_cec_context.mutex);
 		} else {
 			CEC_LOG_INFO("HdmiCecClose invoked from rx_thread; deferring FD cleanup to thread exit");
 		}
@@ -720,25 +721,34 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 		return HDMI_CEC_IO_SUCCESS;
 	}
 
-/* Wait for any in-progress callbacks to complete before tearing down FDs.
-	 * Proceeding with cleanup while callbacks are still active can close descriptors
-	 * out from under callback code (including callbacks that called HdmiCecClose itself),
-	 * causing use-after-close and inconsistent state. Previous timeout-based approach
-	 * allowed cleanup to proceed with active callbacks still in-flight, violating refcount
-	 * semantics and risking callback_active underflow. Now we wait indefinitely. */
+	/* Wait for in-progress callbacks before teardown, but keep shutdown bounded.
+	 * On timeout, surface an error and leave state open for a later retry. */
 	pthread_mutex_lock(&g_cec_context.mutex);
 	int wait_count = 0;
-	while (g_cec_context.callback_active > 0) {
-		if ((wait_count % CEC_CLOSE_MAX_WAIT_ITERATIONS) == 0) {
-			CEC_LOG_WARN("Waiting for %d active callback(s) to finish before closing",
-		             g_cec_context.callback_active);
-		}
+	while (g_cec_context.callback_active > 0 &&
+	       wait_count < CEC_CLOSE_MAX_WAIT_ITERATIONS) {
+		bool should_log = (wait_count == 0);
+		int active_callbacks = g_cec_context.callback_active;
 		pthread_mutex_unlock(&g_cec_context.mutex);
+		if (should_log) {
+			CEC_LOG_WARN("Waiting for %d active callback(s) to finish before closing",
+			             active_callbacks);
+		}
 		usleep(CEC_CALLBACK_WAIT_US);
 		pthread_mutex_lock(&g_cec_context.mutex);
 		wait_count++;
 	}
+	int callbacks_left = g_cec_context.callback_active;
+	bool callbacks_timed_out = (callbacks_left > 0);
 	pthread_mutex_unlock(&g_cec_context.mutex);
+
+	if (callbacks_timed_out) {
+		pthread_mutex_lock(&g_cec_context.mutex);
+		g_cec_context.initialized = true;
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		CEC_LOG_ERROR("Timed out waiting for %d active callback(s) during close", callbacks_left);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
 
 	/* Release CEC resources. callback_active is now guaranteed to be 0,
 	 * so no callback will access these FDs or the context structure. */
@@ -1157,14 +1167,17 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 
 	if (should_call) {
 		tx_cb(cb_handle, tx_cb_data, *result);
+		bool callback_active_underflow = false;
 		pthread_mutex_lock(&g_cec_context.mutex);
-		/* Guard against underflow: callback may have triggered HdmiCecClose(). */
 		if (g_cec_context.callback_active > 0) {
 			g_cec_context.callback_active--;
 		} else {
-			CEC_LOG_WARN("callback_active already 0 in HdmiCecTx; skipping decrement");
+			callback_active_underflow = true;
 		}
 		pthread_mutex_unlock(&g_cec_context.mutex);
+		if (callback_active_underflow) {
+			CEC_LOG_WARN("callback_active already 0 in HdmiCecTx; skipping decrement");
+		}
 	}
 
 	/* Return value: preserve prior observable behavior for callers that check the return code.
