@@ -22,12 +22,13 @@
  *
  * This implementation uses the standard Linux CEC kernel API (/dev/cec0).
  * CEC messages are sent and received via POSIX ioctls on the CEC device node.
- * A dedicated receive thread uses select() + CEC_RECEIVE to deliver callbacks.
+ * A dedicated receive thread uses poll() + CEC_RECEIVE to deliver callbacks.
  */
 
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -386,9 +387,16 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	char lock_path[128];
 	const char *base = strrchr(dev_path, '/');
 	base = base ? base + 1 : dev_path;
-	int lock_path_len = snprintf(lock_path, sizeof(lock_path), "/var/lock/RCECHal_%s.lock", base);
+	int lock_path_len = snprintf(lock_path, sizeof(lock_path), "/run/lock/RCECHal_%s.lock", base);
 	if (lock_path_len < 0 || (size_t)lock_path_len >= sizeof(lock_path)) {
 		CEC_LOG_ERROR("CEC device path too long to form lock file name: %s", dev_path);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
+
+	/* Ensure /run/lock directory exists. mkdir() silently succeeds if already present. */
+	if (mkdir("/run/lock", 0755) < 0 && errno != EEXIST) {
+		CEC_LOG_ERROR("Failed to create /run/lock directory: %s", strerror(errno));
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -716,17 +724,17 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
-	int fd = g_cec_context.fd;
-	pthread_mutex_unlock(&g_cec_context.mutex);
-
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.timeout = CEC_TX_TIMEOUT_MS; /* block until ACK/NACK */
 	memcpy(msg.msg, buf, (size_t)len);
 	msg.len = (__u32)len;
 
-	if (ioctl(fd, CEC_TRANSMIT, &msg) < 0) {
+	/* Keep the mutex held during transmit so HdmiCecClose cannot close/reuse
+	 * g_cec_context.fd while this ioctl is in progress. */
+	if (ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg) < 0) {
 		CEC_LOG_ERROR("CEC_TRANSMIT failed: %s", strerror(errno));
+		pthread_mutex_unlock(&g_cec_context.mutex);
 		*result = HDMI_CEC_IO_SENT_FAILED;
 		return HDMI_CEC_IO_SENT_FAILED;
 	}
@@ -740,7 +748,6 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	}
 
 	/* Fire tx_callback with the transmission result */
-	pthread_mutex_lock(&g_cec_context.mutex);
 	HdmiCecTxCallback_t tx_cb = g_cec_context.tx_callback;
 	void *tx_cb_data           = g_cec_context.tx_callback_data;
 	int cb_handle              = g_cec_context.handle;
@@ -778,19 +785,21 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
-	int fd = g_cec_context.fd;
-	pthread_mutex_unlock(&g_cec_context.mutex);
-
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.timeout = 0; /* async: do not wait; tx_status returned via CEC_RECEIVE */
 	memcpy(msg.msg, buf, (size_t)len);
 	msg.len = (__u32)len;
 
-	if (ioctl(fd, CEC_TRANSMIT, &msg) < 0) {
+	/* Keep the mutex held while submitting async transmit to avoid close-race
+	 * on g_cec_context.fd. */
+	if (ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg) < 0) {
 		CEC_LOG_ERROR("CEC_TRANSMIT (async) failed: %s", strerror(errno));
+		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_SENT_FAILED;
 	}
+
+	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	/* tx_callback will be invoked from cec_rx_thread when the TX status
 	 * is delivered back via CEC_RECEIVE */
