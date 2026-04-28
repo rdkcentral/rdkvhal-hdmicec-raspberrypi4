@@ -2,7 +2,7 @@
  * If not stated otherwise in this file or this component's LICENSE file the
  * following copyright and licenses apply:
  *
- * Copyright 2024 RDK Management
+ * Copyright 2026 RDK Management
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,8 +20,7 @@
 /*
  * Raspberry Pi Linux CEC Subsystem-based HAL Implementation
  *
- * This implementation uses the standard Linux CEC kernel API (/dev/cec0)
- * instead of the deprecated Raspberry Pi Userland VCHI interface.
+ * This implementation uses the standard Linux CEC kernel API (/dev/cec0).
  * CEC messages are sent and received via POSIX ioctls on the CEC device node.
  * A dedicated receive thread uses select() + CEC_RECEIVE to deliver callbacks.
  */
@@ -37,8 +36,8 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
-#include <sys/select.h>
 #include <sys/file.h>
+#include <poll.h>
 #include <stdarg.h>
 
 #include <linux/cec.h>
@@ -278,24 +277,28 @@ static void *cec_rx_thread(void *arg)
 	cec_context_t *ctx = (cec_context_t *)arg;
 
 	while (1) {
-		fd_set rfds;
-		FD_ZERO(&rfds);
-		FD_SET(ctx->fd, &rfds);
-		FD_SET(ctx->pipe_rd, &rfds);
-		int maxfd = (ctx->fd > ctx->pipe_rd) ? ctx->fd : ctx->pipe_rd;
+		/* poll() has no fd upper-bound limit, unlike select()/FD_SET which
+		 * causes buffer overflow when fd >= FD_SETSIZE (1024). */
+		struct pollfd pfds[2];
+		pfds[0].fd     = ctx->fd;
+		pfds[0].events = POLLIN;
+		pfds[1].fd     = ctx->pipe_rd;
+		pfds[1].events = POLLIN;
 
-		int ret = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+		int ret = poll(pfds, 2, -1);
 		if (ret < 0) {
 			if (errno == EINTR) continue;
-			CEC_LOG_ERROR("select() failed: %s", strerror(errno));
+			CEC_LOG_ERROR("poll() failed: %s", strerror(errno));
 			break;
 		}
 
-		/* Shutdown requested */
-		if (FD_ISSET(ctx->pipe_rd, &rfds))
+		/* Shutdown requested via self-pipe: HdmiCecClose() or destructor writes 1 byte
+		 * to pipe_wr, which makes pipe_rd readable (pfds[1].revents & POLLIN),
+		 * triggering clean thread exit. This avoids unsafe pthread_cancel(). */
+		if (pfds[1].revents & POLLIN)
 			break;
 
-		if (!FD_ISSET(ctx->fd, &rfds))
+		if (!(pfds[0].revents & POLLIN))
 			continue;
 
 		struct cec_msg msg;
@@ -334,7 +337,7 @@ static void *cec_rx_thread(void *arg)
 
 		/* Received CEC message */
 		if ((msg.rx_status & CEC_RX_STATUS_OK) && msg.len > 0) {
-			CEC_LOG_INFO("Received CEC message: len=%u", msg.len);
+			CEC_LOG_INFO("Received CEC message: len=%u", (unsigned int)msg.len);
 
 			pthread_mutex_lock(&ctx->mutex);
 			HdmiCecRxCallback_t rx_cb = ctx->rx_callback;
@@ -383,7 +386,12 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	char lock_path[128];
 	const char *base = strrchr(dev_path, '/');
 	base = base ? base + 1 : dev_path;
-	snprintf(lock_path, sizeof(lock_path), "/var/lock/RCECHal_%s.lock", base);
+	int lock_path_len = snprintf(lock_path, sizeof(lock_path), "/var/lock/RCECHal_%s.lock", base);
+	if (lock_path_len < 0 || (size_t)lock_path_len >= sizeof(lock_path)) {
+		CEC_LOG_ERROR("CEC device path too long to form lock file name: %s", dev_path);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
 
 	int lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
 	if (lock_fd < 0) {
