@@ -382,7 +382,7 @@ static void *cec_rx_thread(void *arg)
  * @brief Initializes the HDMI CEC HAL
  *
  * This function is required to be called before the other APIs in this module.@n
- * Subsequent calls to this API will return HDMI_CEC_IO_SUCCESS.
+ * Subsequent calls to this API will return HDMI_CEC_IO_ALREADY_OPEN.
  * For HDMI source devices, logical address discovery takes place during HdmiCecOpen() and
  * can be obtained via HdmiCecGetLogicalAddress().
  * For HDMI sink devices, logical address discovery does not occur during HdmiCecOpen() and
@@ -394,7 +394,7 @@ static void *cec_rx_thread(void *arg)
  * @return HDMI_CEC_STATUS                        - Status
  * @retval HDMI_CEC_IO_SUCCESS                    - Success
  * @retval HDMI_CEC_IO_ALREADY_OPEN               - Function is already open.
- *                                                  This error code will deprecated in the next phase.
+ *                                                  This error code will be deprecated in the next phase.
  * @retval HDMI_CEC_IO_INVALID_ARGUMENT           - Parameter passed to this function is invalid
  * @retval HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE - Logical address is not available for source devices.
  *
@@ -588,7 +588,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
  *
  * This function will uninitialise the module.@n
  * Close will clear up registered logical addresses.@n
- * Subsequent calls to this API will return HDMI_CEC_IO_SUCCESS.
+ * Subsequent calls to this API will return HDMI_CEC_IO_NOT_OPENED.
  *
  * @param[in] handle - The handle returned from the HdmiCecOpen(). Non zero value
  *
@@ -887,7 +887,7 @@ HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int *logicalAddress)
  *
  * This function will block if callback invocation is in progress.
  *
- * @param[in] handle                    - The handle returned from the HdmiCecOpen(() function. Non zero value
+ * @param[in] handle                    - The handle returned from the HdmiCecOpen() function. Non zero value
  * @param[in] cbfunc                    - Function pointer to be invoked
  *                                          when a complete message is received
  * @param[in] data                      - Callback data
@@ -991,15 +991,14 @@ HDMI_CEC_STATUS HdmiCecSetTxCallback(int handle, HdmiCecTxCallback_t callback, v
  *                    HDMI_CEC_IO_SENT_FAILED (e.g. collision).
  *
  * @return HDMI_CEC_STATUS                        - Status
- * @retval HDMI_CEC_IO_SUCCESS                    - Success
+ * @retval HDMI_CEC_IO_SUCCESS                    - Transmit ioctl succeeded.
  * @retval HDMI_CEC_IO_NOT_OPENED                 - Module is not initialised
  * @retval HDMI_CEC_IO_INVALID_ARGUMENT           - Parameter passed to this function is invalid
  * @retval HDMI_CEC_IO_INVALID_HANDLE             - An invalid handle argument has been passed
- * @retval HDMI_CEC_IO_SENT_AND_ACKD              - Cec message is send and acknowledged.
- * @retval HDMI_CEC_IO_SENT_BUT_NOT_ACKD          - Message sent but not acknowledged
- *                                                    by the receiver. Host device is trying to
- *                                                    send an invalid logical address
- * @retval HDMI_CEC_IO_SENT_FAILED                - Send message failed
+ * @retval HDMI_CEC_IO_SENT_FAILED                - Transmit ioctl failed (API/transport failure).
+ *
+ * Message-delivery outcomes (ACK/NACK/collision) are reported via @p result
+ * and tx_callback, not via the function return value.
  *
  * @pre  HdmiCecOpen() should be called before calling this API.
  * @warning  This API is Not thread safe.
@@ -1078,7 +1077,7 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
  * @brief Writes CEC message onto bus asynchronously.
  *
  * This function writes a complete CEC message onto the bus but does not wait
- * for ACK. The result will be reported via HdmiCecRxCallback_t()
+ * for ACK. The result will be reported via HdmiCecTxCallback_t()
  *
  *
  * @param[in] handle                              - The handle returned from the
