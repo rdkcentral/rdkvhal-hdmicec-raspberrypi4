@@ -62,6 +62,11 @@
 #endif
 #define CEC_DEVICE_PATH_DEFAULT CEC_DEV_NODE
 
+/* linux/cec.h uses different spellings across kernel versions. */
+#if !defined(CEC_MODE_EXCL_FOLLOWER_PASSTHROUGH) && defined(CEC_MODE_EXCL_FOLLOWER_PASSTHRU)
+#define CEC_MODE_EXCL_FOLLOWER_PASSTHROUGH CEC_MODE_EXCL_FOLLOWER_PASSTHRU
+#endif
+
 #define CEC_TIMESTAMP_FALLBACK  "_TIMESTAMP_UNAVAILABLE_"
 #define CEC_TIMESTAMP_SIZE      64
 
