@@ -105,6 +105,7 @@ typedef struct {
 	pthread_t rx_thread;
 	bool rx_thread_running;
 	bool deferred_cleanup;
+	bool closing;
 	int handle;
 	bool initialized;
 	bool running;
@@ -282,6 +283,7 @@ static cec_context_t g_cec_context = {
 	.lock_fd          = -1,
 	.rx_thread_running = false,
 	.deferred_cleanup = false,
+	.closing          = false,
 	.handle           = 0,
 	.initialized      = false,
 	.running          = false,
@@ -430,6 +432,8 @@ static void *cec_rx_thread(void *arg)
 		ctx->physical_address    = CEC_PHYS_ADDR_INVALID;
 		ctx->callback_active     = 0;
 		ctx->deferred_cleanup    = false;
+		ctx->closing             = false;
+		ctx->initialized         = false;
 	}
 	ctx->rx_thread_running = false;
 	pthread_mutex_unlock(&ctx->mutex);
@@ -473,7 +477,8 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 
 	pthread_mutex_lock(&g_cec_context.mutex);
 
-	if (g_cec_context.initialized) {
+	if (g_cec_context.initialized || g_cec_context.closing ||
+	    g_cec_context.rx_thread_running || g_cec_context.deferred_cleanup) {
 		CEC_LOG_ERROR("%s already opened", __func__);
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_ALREADY_OPEN;
@@ -642,6 +647,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	}
 	g_cec_context.rx_thread_running = true;
 	g_cec_context.deferred_cleanup = false;
+	g_cec_context.closing = false;
 
 	*handle = g_cec_context.handle;
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -675,7 +681,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 {
 	pthread_mutex_lock(&g_cec_context.mutex);
 
-	if (!g_cec_context.initialized) {
+	if (!g_cec_context.initialized && !g_cec_context.closing) {
 		CEC_LOG_ERROR("CEC not opened");
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_NOT_OPENED;
@@ -694,10 +700,14 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_t rx_thread = g_cec_context.rx_thread;
 	int pipe_wr = g_cec_context.pipe_wr;
 
+	g_cec_context.closing     = true;
 	g_cec_context.running     = false;
-	g_cec_context.initialized = false;
 	if (close_from_rx_thread) {
+		/* Keep logically open until deferred cleanup completes so Open()
+		 * cannot race and overwrite the context while rx_thread exits. */
 		g_cec_context.deferred_cleanup = true;
+	} else {
+		g_cec_context.initialized = false;
 	}
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -743,9 +753,6 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (callbacks_timed_out) {
-		pthread_mutex_lock(&g_cec_context.mutex);
-		g_cec_context.initialized = true;
-		pthread_mutex_unlock(&g_cec_context.mutex);
 		CEC_LOG_ERROR("Timed out waiting for %d active callback(s) during close", callbacks_left);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -774,6 +781,8 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	 * somehow completes after wait loop, its decrement will be valid and won't
 	 * cause underflow. */
 	g_cec_context.deferred_cleanup    = false;
+	g_cec_context.closing             = false;
+	g_cec_context.initialized         = false;
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 	CEC_LOG_INFO("HdmiCecClose successful");
@@ -1181,9 +1190,10 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	}
 
 	/* Return value: preserve prior observable behavior for callers that check the return code.
-	 * For backward compatibility with the userland implementation, return SENT_FAILED when
-	 * the ioctl succeeds but the message delivery was not ACK'd (e.g., collision/arb-lost).
-	 * ACK/NACK outcomes are also reported via *result and tx_callback. */
+	 * For backward compatibility with the userland implementation, return SENT_FAILED only for
+	 * actual transmit failures (i.e., when *result == HDMI_CEC_IO_SENT_FAILED, such as
+	 * collision/arb-lost). ACK and NACK outcomes are reported via *result and tx_callback,
+	 * while this function still returns HDMI_CEC_IO_SUCCESS for those cases. */
 	if (*result == HDMI_CEC_IO_SENT_FAILED)
 		return HDMI_CEC_IO_SENT_FAILED;
 	return HDMI_CEC_IO_SUCCESS;
@@ -1281,22 +1291,41 @@ static void __attribute__((destructor)) cec_driver_term(void)
 		return;
 	}
 
+	bool need_cleanup = false;
+	bool need_join = false;
+	pthread_t rx_thread_to_join = (pthread_t)0;
+	int pipe_wr = g_cec_context.pipe_wr;
+
 	if (g_cec_context.initialized) {
 		CEC_LOG_WARN("CEC device still open during shutdown");
 		g_cec_context.running     = false;
 		g_cec_context.initialized = false;
-		pthread_mutex_unlock(&g_cec_context.mutex);
+		need_cleanup = true;
+	}
+	if (g_cec_context.rx_thread_running || g_cec_context.deferred_cleanup || g_cec_context.closing) {
+		need_cleanup = true;
+	}
+	if (g_cec_context.rx_thread_running) {
+		need_join = true;
+		rx_thread_to_join = g_cec_context.rx_thread;
+	}
 
-		/* Signal and join rx_thread */
-		if (g_cec_context.rx_thread_running) {
-			char byte = 1;
-			(void)write(g_cec_context.pipe_wr, &byte, 1);
-			pthread_join(g_cec_context.rx_thread, NULL);
-			g_cec_context.rx_thread_running = false;
-		}
+	pthread_mutex_unlock(&g_cec_context.mutex);
 
+	/* Signal and join rx_thread even if initialized is already false. */
+	if (need_join) {
+		char byte = 1;
+		(void)write(pipe_wr, &byte, 1);
+		pthread_join(rx_thread_to_join, NULL);
+	}
+
+	pthread_mutex_lock(&g_cec_context.mutex);
+	if (need_join) {
+		g_cec_context.rx_thread_running = false;
+	}
+
+	if (need_cleanup) {
 		/* Wait briefly for callbacks */
-		pthread_mutex_lock(&g_cec_context.mutex);
 		int wait_count = 0;
 		while (g_cec_context.callback_active > 0 &&
 		       wait_count < CEC_DESTRUCTOR_MAX_WAIT_ITERATIONS) {
@@ -1314,6 +1343,8 @@ static void __attribute__((destructor)) cec_driver_term(void)
 		g_cec_context.pipe_rd = -1;
 		g_cec_context.pipe_wr = -1;
 		g_cec_context.lock_fd = -1;
+		g_cec_context.deferred_cleanup = false;
+		g_cec_context.closing = false;
 	}
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
