@@ -434,6 +434,12 @@ static void *cec_rx_thread(void *arg)
 		ctx->deferred_cleanup    = false;
 		ctx->closing             = false;
 		ctx->initialized         = false;
+	} else {
+		/* Unexpected thread exit (poll error / device error) without deferred_cleanup.
+		 * Mark the context as no longer running so callers can detect the failure:
+		 * running=false stops new callbacks, initialized stays true so HdmiCecClose()
+		 * can still clean up properly. */
+		ctx->running = false;
 	}
 	ctx->rx_thread_running = false;
 	pthread_mutex_unlock(&ctx->mutex);
@@ -509,9 +515,26 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
-	int lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+	int lock_open_flags = O_CREAT | O_RDWR | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+	lock_open_flags |= O_NOFOLLOW;
+#endif
+	int lock_fd = open(lock_path, lock_open_flags, 0600);
 	if (lock_fd < 0) {
 		CEC_LOG_ERROR("Failed to open lock file %s: %s", lock_path, strerror(errno));
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
+	struct stat lock_st;
+	if (fstat(lock_fd, &lock_st) < 0) {
+		CEC_LOG_ERROR("Failed to stat lock file %s: %s", lock_path, strerror(errno));
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
+	if (!S_ISREG(lock_st.st_mode)) {
+		CEC_LOG_ERROR("Lock file %s is not a regular file", lock_path);
+		close(lock_fd);
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -753,6 +776,14 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (callbacks_timed_out) {
+		/* Close did not complete cleanly. Restore the instance to a logically open
+		 * state so that the caller can retry HdmiCecClose() with the same handle
+		 * later. Without this, closing==true would permanently block HdmiCecOpen()
+		 * while the FDs remain open and the handle is still allocated. */
+		pthread_mutex_lock(&g_cec_context.mutex);
+		g_cec_context.initialized = true;
+		g_cec_context.closing     = false;
+		pthread_mutex_unlock(&g_cec_context.mutex);
 		CEC_LOG_ERROR("Timed out waiting for %d active callback(s) during close", callbacks_left);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
@@ -1166,7 +1197,11 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		*result = HDMI_CEC_IO_SENT_FAILED;
 	}
 
-	/* Fire tx_callback with the transmission result */
+	/* Fire tx_callback with the transmission result.
+	 * NOTE: if the callback calls HdmiCecClose() it will wait for callback_active
+	 * to reach 0 before proceeding. Detect that case (close_from_rx_thread is not
+	 * applicable here since we are on the caller's thread) and use the same
+	 * pthread_equal self-close guard so Close can proceed without deadlocking. */
 	HdmiCecTxCallback_t tx_cb = g_cec_context.tx_callback;
 	void *tx_cb_data           = g_cec_context.tx_callback_data;
 	int cb_handle              = g_cec_context.handle;
