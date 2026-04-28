@@ -21,6 +21,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 # Get git commit SHA
 execute_process(
@@ -56,7 +57,7 @@ set_target_properties(${LIBNAME} PROPERTIES
 )
 
 target_include_directories(${LIBNAME} PRIVATE ${HDMI_CEC_INCLUDE_DIR})
-target_link_libraries(${LIBNAME} PRIVATE pthread)
+target_link_libraries(${LIBNAME} PRIVATE Threads::Threads)
 
 target_compile_definitions(${LIBNAME} PRIVATE
     HAL_VERSION="${PROJECT_VERSION}"

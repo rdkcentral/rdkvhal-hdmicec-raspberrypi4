@@ -104,6 +104,7 @@ typedef struct {
 	int lock_fd;                  /* singleton flock() lock file descriptor */
 	pthread_t rx_thread;
 	bool rx_thread_running;
+	bool deferred_cleanup;
 	int handle;
 	bool initialized;
 	bool running;
@@ -179,7 +180,20 @@ static void cec_log_init_impl(void)
 	}
 
 	if (log_file_env != NULL) {
-		g_log_file = fopen(log_file_env, "a");
+		int log_fd = -1;
+		int log_flags = O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+		log_flags |= O_NOFOLLOW;
+#endif
+		log_fd = open(log_file_env, log_flags, 0644);
+		if (log_fd >= 0) {
+			g_log_file = fdopen(log_fd, "a");
+			if (g_log_file == NULL) {
+				close(log_fd);
+			}
+		} else {
+			g_log_file = NULL;
+		}
 		if (g_log_file != NULL) {
 			setvbuf(g_log_file, NULL, _IOLBF, 0);
 			char timestamp[CEC_TIMESTAMP_SIZE];
@@ -255,7 +269,10 @@ static int cec_generate_handle(void)
 		int handle = (int)((ts.tv_sec ^ ts.tv_nsec ^ getpid()) & 0x7FFFFFFF);
 		return handle ? handle : 1;
 	}
-	return (int)(time(NULL) & 0x7FFFFFFF) ?: 1;
+	{
+		int handle = (int)(time(NULL) & 0x7FFFFFFF);
+		return handle ? handle : 1;
+	}
 }
 
 static cec_context_t g_cec_context = {
@@ -264,6 +281,7 @@ static cec_context_t g_cec_context = {
 	.pipe_wr          = -1,
 	.lock_fd          = -1,
 	.rx_thread_running = false,
+	.deferred_cleanup = false,
 	.handle           = 0,
 	.initialized      = false,
 	.running          = false,
@@ -375,6 +393,31 @@ static void *cec_rx_thread(void *arg)
 		}
 	}
 
+	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->deferred_cleanup) {
+		if (ctx->pipe_wr >= 0) close(ctx->pipe_wr);
+		if (ctx->pipe_rd >= 0) close(ctx->pipe_rd);
+		if (ctx->fd >= 0)      close(ctx->fd);
+		if (ctx->lock_fd >= 0) close(ctx->lock_fd);
+
+		ctx->fd                  = -1;
+		ctx->pipe_rd             = -1;
+		ctx->pipe_wr             = -1;
+		ctx->lock_fd             = -1;
+		ctx->handle              = 0;
+		ctx->rx_callback         = NULL;
+		ctx->rx_callback_data    = NULL;
+		ctx->tx_callback         = NULL;
+		ctx->tx_callback_data    = NULL;
+		ctx->logical_address     = CEC_LOG_ADDR_UNREGISTERED;
+		ctx->has_logical_address = false;
+		ctx->physical_address    = CEC_PHYS_ADDR_INVALID;
+		ctx->callback_active     = 0;
+		ctx->deferred_cleanup    = false;
+	}
+	ctx->rx_thread_running = false;
+	pthread_mutex_unlock(&ctx->mutex);
+
 	return NULL;
 }
 
@@ -472,6 +515,10 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	__u32 mode = CEC_MODE_INITIATOR | CEC_MODE_EXCL_FOLLOWER_PASSTHROUGH;
 	if (ioctl(fd, CEC_S_MODE, &mode) < 0) {
 		CEC_LOG_ERROR("CEC_S_MODE failed: %s", strerror(errno));
+		close(fd);
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
 	/* Read physical address from the adapter (set by the kernel HDMI driver) */
@@ -497,6 +544,10 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	/* This ioctl blocks until the logical address claiming process completes */
 	if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
 		CEC_LOG_ERROR("CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(errno));
+		close(fd);
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
 	}
 
 	/* Read back the allocated logical address */
@@ -574,6 +625,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 	g_cec_context.rx_thread_running = true;
+	g_cec_context.deferred_cleanup = false;
 
 	*handle = g_cec_context.handle;
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -619,8 +671,15 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
+	/* Self-close from within rx_thread callback cannot join itself. */
+	bool close_from_rx_thread = g_cec_context.rx_thread_running &&
+	                           pthread_equal(pthread_self(), g_cec_context.rx_thread);
+
 	g_cec_context.running     = false;
 	g_cec_context.initialized = false;
+	if (close_from_rx_thread) {
+		g_cec_context.deferred_cleanup = true;
+	}
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
@@ -628,8 +687,17 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	if (g_cec_context.rx_thread_running) {
 		char byte = 1;
 		(void)write(g_cec_context.pipe_wr, &byte, 1);
-		pthread_join(g_cec_context.rx_thread, NULL);
-		g_cec_context.rx_thread_running = false;
+		if (!close_from_rx_thread) {
+			pthread_join(g_cec_context.rx_thread, NULL);
+			g_cec_context.rx_thread_running = false;
+		} else {
+			CEC_LOG_INFO("HdmiCecClose invoked from rx_thread; deferring FD cleanup to thread exit");
+		}
+	}
+
+	if (close_from_rx_thread) {
+		CEC_LOG_INFO("HdmiCecClose successful (deferred cleanup)");
+		return HDMI_CEC_IO_SUCCESS;
 	}
 
 	/* Wait for any in-progress callbacks to complete */
@@ -666,9 +734,9 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	g_cec_context.has_logical_address = false;
 	g_cec_context.physical_address    = CEC_PHYS_ADDR_INVALID;
 	g_cec_context.callback_active     = 0;
+	g_cec_context.deferred_cleanup    = false;
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
-
 	CEC_LOG_INFO("HdmiCecClose successful");
 	return HDMI_CEC_IO_SUCCESS;
 }
