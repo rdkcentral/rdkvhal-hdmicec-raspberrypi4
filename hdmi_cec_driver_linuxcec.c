@@ -553,6 +553,24 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
+	/* Validate that the opened path is a character device. Rejects plain files,
+	 * symlink-redirected regular files, directories, etc. when running as root. */
+	struct stat dev_st;
+	if (fstat(fd, &dev_st) < 0) {
+		CEC_LOG_ERROR("Failed to stat %s: %s", dev_path, strerror(errno));
+		close(fd);
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
+	if (!S_ISCHR(dev_st.st_mode)) {
+		CEC_LOG_ERROR("%s is not a character device", dev_path);
+		close(fd);
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
+
 	/* Set mode: exclusive initiator + exclusive follower with passthrough.
 	 * Passthrough allows receiving messages addressed to other devices so
 	 * that the upper CEC layer can observe all bus traffic. */
@@ -776,12 +794,15 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (callbacks_timed_out) {
-		/* Close did not complete cleanly. Restore the instance to a logically open
-		 * state so that the caller can retry HdmiCecClose() with the same handle
-		 * later. Without this, closing==true would permanently block HdmiCecOpen()
-		 * while the FDs remain open and the handle is still allocated. */
+		/* Close did not complete cleanly. Restore the instance to a fully consistent
+		 * open state so the caller can retry HdmiCecClose() using the same handle.
+		 * running must also be restored (not just initialized/closing) so the context
+		 * is self-consistent: initialized+running+FDs open but rx_thread already
+		 * joined.  A retry call to Close will skip the join (rx_thread_running==false)
+		 * and only wait for the remaining callbacks to quiesce. */
 		pthread_mutex_lock(&g_cec_context.mutex);
 		g_cec_context.initialized = true;
+		g_cec_context.running     = true;
 		g_cec_context.closing     = false;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		CEC_LOG_ERROR("Timed out waiting for %d active callback(s) during close", callbacks_left);
@@ -1197,32 +1218,14 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		*result = HDMI_CEC_IO_SENT_FAILED;
 	}
 
-	/* Fire tx_callback with the transmission result.
-	 * NOTE: if the callback calls HdmiCecClose() it will wait for callback_active
-	 * to reach 0 before proceeding. Detect that case (close_from_rx_thread is not
-	 * applicable here since we are on the caller's thread) and use the same
-	 * pthread_equal self-close guard so Close can proceed without deadlocking. */
-	HdmiCecTxCallback_t tx_cb = g_cec_context.tx_callback;
-	void *tx_cb_data           = g_cec_context.tx_callback_data;
-	int cb_handle              = g_cec_context.handle;
-	bool should_call = g_cec_context.running && g_cec_context.initialized && tx_cb != NULL;
-	if (should_call) g_cec_context.callback_active++;
+	/* Do not fire tx_callback inline here. The rx_thread will deliver the TX
+	 * completion event when CEC_RECEIVE returns a message with tx_status set.
+	 * Firing it synchronously from HdmiCecTx would: (a) double-invoke the callback
+	 * (rx_thread fires it again for the same event), and (b) deadlock if the
+	 * callback calls HdmiCecClose() — Close waits for callback_active==0, which
+	 * can't happen until the callback returns. The caller already has the outcome
+	 * in *result; tx_callback is notified asynchronously via the rx_thread. */
 	pthread_mutex_unlock(&g_cec_context.mutex);
-
-	if (should_call) {
-		tx_cb(cb_handle, tx_cb_data, *result);
-		bool callback_active_underflow = false;
-		pthread_mutex_lock(&g_cec_context.mutex);
-		if (g_cec_context.callback_active > 0) {
-			g_cec_context.callback_active--;
-		} else {
-			callback_active_underflow = true;
-		}
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		if (callback_active_underflow) {
-			CEC_LOG_WARN("callback_active already 0 in HdmiCecTx; skipping decrement");
-		}
-	}
 
 	/* Return value: preserve prior observable behavior for callers that check the return code.
 	 * For backward compatibility with the userland implementation, return SENT_FAILED only for
