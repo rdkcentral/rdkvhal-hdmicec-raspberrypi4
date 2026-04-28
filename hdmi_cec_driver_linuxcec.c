@@ -268,7 +268,7 @@ static cec_context_t g_cec_context = {
 };
 
 /*
- * Receive thread: blocks on select() multiplexed between the CEC device fd
+ * Receive thread: blocks on poll() multiplexed between the CEC device fd
  * and a shutdown pipe.  For each CEC_RECEIVE result:
  *   - tx_status set  → TX completion, invoke tx_callback
  *   - rx_status OK   → incoming message, invoke rx_callback
@@ -298,6 +298,12 @@ static void *cec_rx_thread(void *arg)
 		 * triggering clean thread exit. This avoids unsafe pthread_cancel(). */
 		if (pfds[1].revents & POLLIN)
 			break;
+
+		/* Check for CEC device errors (adapter removed, driver reset, etc.) */
+		if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+			CEC_LOG_ERROR("CEC device poll error: revents=0x%x", pfds[0].revents);
+			break;
+		}
 
 		if (!(pfds[0].revents & POLLIN))
 			continue;
@@ -472,6 +478,30 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	int pipefd[2];
 	if (pipe(pipefd) < 0) {
 		CEC_LOG_ERROR("pipe() failed: %s", strerror(errno));
+		close(fd);
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
+
+	/* Set close-on-exec on pipe read end to prevent descriptor leaks into child processes */
+	int pipe_rd_flags = fcntl(pipefd[0], F_GETFD);
+	if (pipe_rd_flags < 0 || fcntl(pipefd[0], F_SETFD, pipe_rd_flags | FD_CLOEXEC) < 0) {
+		CEC_LOG_ERROR("fcntl(FD_CLOEXEC) failed for pipe read end: %s", strerror(errno));
+		close(pipefd[0]);
+		close(pipefd[1]);
+		close(fd);
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_GENERAL_ERROR;
+	}
+
+	/* Set close-on-exec on pipe write end */
+	int pipe_wr_flags = fcntl(pipefd[1], F_GETFD);
+	if (pipe_wr_flags < 0 || fcntl(pipefd[1], F_SETFD, pipe_wr_flags | FD_CLOEXEC) < 0) {
+		CEC_LOG_ERROR("fcntl(FD_CLOEXEC) failed for pipe write end: %s", strerror(errno));
+		close(pipefd[0]);
+		close(pipefd[1]);
 		close(fd);
 		close(lock_fd);
 		pthread_mutex_unlock(&g_cec_context.mutex);
@@ -762,7 +792,9 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		pthread_mutex_unlock(&g_cec_context.mutex);
 	}
 
-	return HDMI_CEC_IO_SUCCESS;
+	/* Return the actual transmission result, not just SUCCESS.
+	 * Caller checks return value for failure; must reflect tx_status. */
+	return *result;
 }
 
 HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
