@@ -543,6 +543,44 @@ static void cec_refresh_logical_address_locked(void)
 }
 
 /* Must be called with g_cec_context.mutex held.
+ * Logs adapter state at transmit failure time to diagnose EINVAL. */
+static void cec_log_tx_diagnostics_locked(const struct cec_msg *msg, int len)
+{
+	if (msg != NULL) {
+		CEC_LOG_WARN("TX diag: fd=%d hdr=0x%02x len=%d timeout=%u",
+		             g_cec_context.fd, msg->msg[0], len, msg->timeout);
+	}
+
+	struct cec_log_addrs la;
+	memset(&la, 0, sizeof(la));
+	if (ioctl(g_cec_context.fd, CEC_ADAP_G_LOG_ADDRS, &la) == 0) {
+		CEC_LOG_WARN("TX diag: num_log_addrs=%u, primary0=%u, log_addr0=%u",
+		             (unsigned int)la.num_log_addrs,
+		             (unsigned int)la.primary_device_type[0],
+		             (unsigned int)la.log_addr[0]);
+	} else {
+		CEC_LOG_WARN("TX diag: CEC_ADAP_G_LOG_ADDRS failed: %s", strerror(errno));
+	}
+
+	__u32 mode = 0;
+	if (ioctl(g_cec_context.fd, CEC_G_MODE, &mode) == 0) {
+		CEC_LOG_WARN("TX diag: mode=0x%x", mode);
+	} else {
+		CEC_LOG_WARN("TX diag: CEC_G_MODE failed: %s", strerror(errno));
+	}
+
+	struct cec_caps caps;
+	memset(&caps, 0, sizeof(caps));
+	if (ioctl(g_cec_context.fd, CEC_ADAP_G_CAPS, &caps) == 0) {
+		CEC_LOG_WARN("TX diag: caps=0x%x, avail_log_addrs=%u",
+		             (unsigned int)caps.capabilities,
+		             (unsigned int)caps.available_log_addrs);
+	} else {
+		CEC_LOG_WARN("TX diag: CEC_ADAP_G_CAPS failed: %s", strerror(errno));
+	}
+}
+
+/* Must be called with g_cec_context.mutex held.
  * Re-applies initiator mode and re-claims a logical address if needed. */
 static void cec_recover_tx_state_locked(void)
 {
@@ -1338,6 +1376,7 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
 	if (tx_ret < 0 && errno == EINVAL) {
 		/* Adapter state may have changed (mode/logical address). Recover then retry once. */
+		cec_log_tx_diagnostics_locked(&msg, len);
 		CEC_LOG_WARN("CEC_TRANSMIT returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
 		             msg.msg[0], len);
 		cec_recover_tx_state_locked();
@@ -1456,6 +1495,7 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
 	if (tx_ret < 0 && errno == EINVAL) {
 		/* Adapter state may have changed (mode/logical address). Recover then retry once. */
+		cec_log_tx_diagnostics_locked(&msg, len);
 		CEC_LOG_WARN("CEC_TRANSMIT (async) returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
 		             msg.msg[0], len);
 		cec_recover_tx_state_locked();
