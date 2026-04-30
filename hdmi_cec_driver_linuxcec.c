@@ -517,16 +517,64 @@ static void cec_refresh_logical_address_locked(void)
 {
 	struct cec_log_addrs la;
 	memset(&la, 0, sizeof(la));
-	if (ioctl(g_cec_context.fd, CEC_ADAP_G_LOG_ADDRS, &la) == 0 &&
-	    la.num_log_addrs > 0 && la.log_addr[0] != CEC_LOG_ADDR_INVALID) {
+	if (ioctl(g_cec_context.fd, CEC_ADAP_G_LOG_ADDRS, &la) < 0) {
+		CEC_LOG_WARN("CEC_ADAP_G_LOG_ADDRS failed during refresh: %s", strerror(errno));
+		return;
+	}
+
+	if (la.num_log_addrs > 0 && la.log_addr[0] != CEC_LOG_ADDR_INVALID) {
 		int new_addr = (int)la.log_addr[0];
 		if (new_addr != g_cec_context.logical_address) {
 			CEC_LOG_WARN("Logical address refreshed: %d -> %d",
 			             g_cec_context.logical_address, new_addr);
-			g_cec_context.logical_address = new_addr;
-			g_cec_context.has_logical_address =
-				(new_addr != CEC_LOG_ADDR_UNREGISTERED);
 		}
+		g_cec_context.logical_address = new_addr;
+		g_cec_context.has_logical_address =
+			(new_addr != CEC_LOG_ADDR_UNREGISTERED);
+		return;
+	}
+
+	if (g_cec_context.has_logical_address ||
+	    g_cec_context.logical_address != CEC_LOG_ADDR_UNREGISTERED) {
+		CEC_LOG_WARN("Kernel reports no logical address; marking context as Unregistered");
+	}
+	g_cec_context.logical_address = CEC_LOG_ADDR_UNREGISTERED;
+	g_cec_context.has_logical_address = false;
+}
+
+/* Must be called with g_cec_context.mutex held.
+ * Re-applies initiator mode and re-claims a logical address if needed. */
+static void cec_recover_tx_state_locked(void)
+{
+	__u32 mode = CEC_MODE_INITIATOR | CEC_MODE_EXCL_FOLLOWER_PASSTHROUGH;
+	if (ioctl(g_cec_context.fd, CEC_S_MODE, &mode) < 0) {
+		CEC_LOG_WARN("CEC_S_MODE re-apply failed during TX recovery: %s", strerror(errno));
+	}
+
+	cec_refresh_logical_address_locked();
+	if (g_cec_context.has_logical_address) {
+		return;
+	}
+
+	struct cec_log_addrs log_addrs;
+	memset(&log_addrs, 0, sizeof(log_addrs));
+	log_addrs.num_log_addrs          = 1;
+	log_addrs.cec_version            = CEC_OP_CEC_VERSION_1_4;
+	log_addrs.vendor_id              = RPI_CEC_VENDOR_ID;
+	log_addrs.flags                  = CEC_LOG_ADDRS_FL_ALLOW_UNREG_FALLBACK;
+	strncpy(log_addrs.osd_name, "RDK-STB", sizeof(log_addrs.osd_name) - 1);
+	log_addrs.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_TUNER;
+	log_addrs.log_addr_type[0]       = CEC_LOG_ADDR_TYPE_TUNER;
+	log_addrs.all_device_types[0]    = CEC_OP_ALL_DEVTYPE_TUNER;
+
+	if (ioctl(g_cec_context.fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
+		CEC_LOG_WARN("CEC_ADAP_S_LOG_ADDRS failed during TX recovery: %s", strerror(errno));
+		return;
+	}
+
+	cec_refresh_logical_address_locked();
+	if (g_cec_context.has_logical_address) {
+		CEC_LOG_WARN("Recovered logical address for TX: %d", g_cec_context.logical_address);
 	}
 }
 
@@ -1274,8 +1322,10 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	 * g_cec_context.fd while this ioctl is in progress. */
 	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
 	if (tx_ret < 0 && errno == EINVAL) {
-		/* Logical address may have been lost (e.g., hotplug). Refresh and retry once. */
-		cec_refresh_logical_address_locked();
+		/* Adapter state may have changed (mode/logical address). Recover then retry once. */
+		CEC_LOG_WARN("CEC_TRANSMIT returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
+		             msg.msg[0], len);
+		cec_recover_tx_state_locked();
 		initiator = g_cec_context.has_logical_address ?
 			(__u8)(g_cec_context.logical_address & 0x0F) :
 			(__u8)CEC_LOG_ADDR_UNREGISTERED;
@@ -1389,8 +1439,10 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	 * on g_cec_context.fd. */
 	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
 	if (tx_ret < 0 && errno == EINVAL) {
-		/* Logical address may have been lost (e.g., hotplug). Refresh and retry once. */
-		cec_refresh_logical_address_locked();
+		/* Adapter state may have changed (mode/logical address). Recover then retry once. */
+		CEC_LOG_WARN("CEC_TRANSMIT (async) returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
+		             msg.msg[0], len);
+		cec_recover_tx_state_locked();
 		initiator = g_cec_context.has_logical_address ?
 			(__u8)(g_cec_context.logical_address & 0x0F) :
 			(__u8)CEC_LOG_ADDR_UNREGISTERED;
