@@ -1322,12 +1322,12 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	msg.timeout = CEC_TX_TIMEOUT_MS; /* block until ACK/NACK */
 	/* Keep userland compatibility: ignore caller-provided source nibble and
 	 * transmit from the adapter's currently allocated logical address.
-	 * Per RDK HAL spec: header byte = (destination << 4) | source */
-	__u8 destination = (__u8)((buf[0] >> 4) & 0x0F);  /* bits 7-4 */
+	 * RDK HAL byte order: (source << 4) | destination */
+	__u8 destination = (__u8)(buf[0] & 0x0F);  /* bits 3-0 */
 	__u8 source = g_cec_context.has_logical_address ?
 		(__u8)(g_cec_context.logical_address & 0x0F) :
 		(__u8)CEC_LOG_ADDR_UNREGISTERED;
-	msg.msg[0] = (__u8)((destination << 4) | source);
+	msg.msg[0] = (__u8)((source << 4) | destination);
 	if (len > 1) {
 		memcpy(&msg.msg[1], &buf[1], (size_t)(len - 1));
 	}
@@ -1344,7 +1344,7 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		source = g_cec_context.has_logical_address ?
 			(__u8)(g_cec_context.logical_address & 0x0F) :
 			(__u8)CEC_LOG_ADDR_UNREGISTERED;
-		msg.msg[0] = (__u8)((destination << 4) | source);
+		msg.msg[0] = (__u8)((source << 4) | destination);
 		msg.tx_status = 0;
 		msg.tx_arb_lost_cnt = 0;
 		msg.tx_nack_cnt = 0;
@@ -1440,12 +1440,12 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	msg.timeout = 0; /* async: do not wait; tx_status returned via CEC_RECEIVE */
 	/* Keep userland compatibility: ignore caller-provided source nibble and
 	 * transmit from the adapter's currently allocated logical address.
-	 * Per RDK HAL spec: header byte = (destination << 4) | source */
-	__u8 destination = (__u8)((buf[0] >> 4) & 0x0F);  /* bits 7-4 */
+	 * RDK HAL byte order: (source << 4) | destination */
+	__u8 destination = (__u8)(buf[0] & 0x0F);  /* bits 3-0 */
 	__u8 source = g_cec_context.has_logical_address ?
 		(__u8)(g_cec_context.logical_address & 0x0F) :
 		(__u8)CEC_LOG_ADDR_UNREGISTERED;
-	msg.msg[0] = (__u8)((destination << 4) | source);
+	msg.msg[0] = (__u8)((source << 4) | destination);
 	if (len > 1) {
 		memcpy(&msg.msg[1], &buf[1], (size_t)(len - 1));
 	}
@@ -1462,7 +1462,7 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 		source = g_cec_context.has_logical_address ?
 			(__u8)(g_cec_context.logical_address & 0x0F) :
 			(__u8)CEC_LOG_ADDR_UNREGISTERED;
-		msg.msg[0] = (__u8)((destination << 4) | source);
+		msg.msg[0] = (__u8)((source << 4) | destination);
 		msg.tx_status = 0;
 		msg.tx_arb_lost_cnt = 0;
 		msg.tx_nack_cnt = 0;
