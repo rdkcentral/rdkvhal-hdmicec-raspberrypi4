@@ -276,6 +276,39 @@ static int cec_generate_handle(void)
 	}
 }
 
+void trace_hexdump(const uint8_t *buf, size_t len)
+{
+	if (buf == NULL || len == 0 || g_log_level < CEC_LOG_LEVEL_TRACE)
+		return;
+
+	pthread_mutex_lock(&g_log_mutex);
+	if (g_log_file != NULL) {
+		size_t offset = 0;
+		while (offset < len) {
+			size_t line_len = (len - offset > 16) ? 16 : (len - offset);
+			char ascii[17];
+
+			for (size_t i = 0; i < line_len; i++) {
+				uint8_t byte = buf[offset + i];
+				ascii[i] = (byte >= 32 && byte <= 126) ? (char)byte : '.';
+			}
+			ascii[line_len] = '\0';
+
+			fprintf(g_log_file, "RPICECHAL: %04zx: ", offset);
+			for (size_t i = 0; i < line_len; i++) {
+				fprintf(g_log_file, "%02x ", buf[offset + i]);
+			}
+			for (size_t i = line_len; i < 16; i++) {
+				fprintf(g_log_file, "   ");
+			}
+			fprintf(g_log_file, " %s\n", ascii);
+			offset += line_len;
+		}
+		fflush(g_log_file);
+	}
+	pthread_mutex_unlock(&g_log_mutex);
+}
+
 static cec_context_t g_cec_context = {
 	.fd               = -1,
 	.pipe_rd          = -1,
@@ -408,6 +441,8 @@ static void *cec_rx_thread(void *arg)
 			}
 
 			CEC_LOG_INFO("Received CEC message: len=%u", (unsigned int)msg.len);
+			// dump the message being sent for debugging.
+			trace_hexdump(msg.msg, (size_t)msg.len);
 		}
 	}
 
@@ -474,6 +509,27 @@ static void *cec_rx_thread(void *arg)
  * @see HdmiCecClose()
  *
  */
+
+/* Must be called with g_cec_context.mutex held.
+ * Refreshes logical address from the kernel adapter in case it changed
+ * (e.g., after a hotplug event or external CEC_ADAP_S_LOG_ADDRS call). */
+static void cec_refresh_logical_address_locked(void)
+{
+	struct cec_log_addrs la;
+	memset(&la, 0, sizeof(la));
+	if (ioctl(g_cec_context.fd, CEC_ADAP_G_LOG_ADDRS, &la) == 0 &&
+	    la.num_log_addrs > 0 && la.log_addr[0] != CEC_LOG_ADDR_INVALID) {
+		int new_addr = (int)la.log_addr[0];
+		if (new_addr != g_cec_context.logical_address) {
+			CEC_LOG_WARN("Logical address refreshed: %d -> %d",
+			             g_cec_context.logical_address, new_addr);
+			g_cec_context.logical_address = new_addr;
+			g_cec_context.has_logical_address =
+				(new_addr != CEC_LOG_ADDR_UNREGISTERED);
+		}
+	}
+}
+
 HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 {
 	if (handle == NULL) {
@@ -897,7 +953,7 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int *physicalAddr
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_INVALID_OUTPUT;
 	}
-
+	CEC_LOG_INFO("Physical address: 0x%04x", phys_addr);
 	*physicalAddress = phys_addr;
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
@@ -1019,6 +1075,7 @@ HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int *logicalAddress)
 	}
 
 	*logicalAddress = g_cec_context.logical_address;
+	CEC_LOG_INFO("Logical address: %d", g_cec_context.logical_address);
 	pthread_mutex_unlock(&g_cec_context.mutex);
 	return HDMI_CEC_IO_SUCCESS;
 }
@@ -1181,6 +1238,9 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
+	// dump the message being sent for debugging.
+	trace_hexdump(buf, (size_t)len);
+
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -1198,12 +1258,36 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.timeout = CEC_TX_TIMEOUT_MS; /* block until ACK/NACK */
-	memcpy(msg.msg, buf, (size_t)len);
+	/* Keep userland compatibility: ignore caller-provided initiator nibble and
+	 * transmit from the adapter's currently allocated logical address. */
+	__u8 follower = (__u8)(buf[0] & 0x0F);
+	__u8 initiator = g_cec_context.has_logical_address ?
+		(__u8)(g_cec_context.logical_address & 0x0F) :
+		(__u8)CEC_LOG_ADDR_UNREGISTERED;
+	msg.msg[0] = (__u8)((initiator << 4) | follower);
+	if (len > 1) {
+		memcpy(&msg.msg[1], &buf[1], (size_t)(len - 1));
+	}
 	msg.len = (__u32)len;
 
 	/* Keep the mutex held during transmit so HdmiCecClose cannot close/reuse
 	 * g_cec_context.fd while this ioctl is in progress. */
-	if (ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg) < 0) {
+	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
+	if (tx_ret < 0 && errno == EINVAL) {
+		/* Logical address may have been lost (e.g., hotplug). Refresh and retry once. */
+		cec_refresh_logical_address_locked();
+		initiator = g_cec_context.has_logical_address ?
+			(__u8)(g_cec_context.logical_address & 0x0F) :
+			(__u8)CEC_LOG_ADDR_UNREGISTERED;
+		msg.msg[0] = (__u8)((initiator << 4) | follower);
+		msg.tx_status = 0;
+		msg.tx_arb_lost_cnt = 0;
+		msg.tx_nack_cnt = 0;
+		msg.tx_low_drive_cnt = 0;
+		msg.tx_error_cnt = 0;
+		tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
+	}
+	if (tx_ret < 0) {
 		CEC_LOG_ERROR("CEC_TRANSMIT failed: %s", strerror(errno));
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		*result = HDMI_CEC_IO_SENT_FAILED;
@@ -1271,6 +1355,9 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
+	// dump the message being sent for debugging.
+	trace_hexdump(buf, (size_t)len);
+
 	pthread_mutex_lock(&g_cec_context.mutex);
 
 	if (!g_cec_context.initialized) {
@@ -1286,12 +1373,36 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.timeout = 0; /* async: do not wait; tx_status returned via CEC_RECEIVE */
-	memcpy(msg.msg, buf, (size_t)len);
+	/* Keep userland compatibility: ignore caller-provided initiator nibble and
+	 * transmit from the adapter's currently allocated logical address. */
+	__u8 follower = (__u8)(buf[0] & 0x0F);
+	__u8 initiator = g_cec_context.has_logical_address ?
+		(__u8)(g_cec_context.logical_address & 0x0F) :
+		(__u8)CEC_LOG_ADDR_UNREGISTERED;
+	msg.msg[0] = (__u8)((initiator << 4) | follower);
+	if (len > 1) {
+		memcpy(&msg.msg[1], &buf[1], (size_t)(len - 1));
+	}
 	msg.len = (__u32)len;
 
 	/* Keep the mutex held while submitting async transmit to avoid close-race
 	 * on g_cec_context.fd. */
-	if (ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg) < 0) {
+	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
+	if (tx_ret < 0 && errno == EINVAL) {
+		/* Logical address may have been lost (e.g., hotplug). Refresh and retry once. */
+		cec_refresh_logical_address_locked();
+		initiator = g_cec_context.has_logical_address ?
+			(__u8)(g_cec_context.logical_address & 0x0F) :
+			(__u8)CEC_LOG_ADDR_UNREGISTERED;
+		msg.msg[0] = (__u8)((initiator << 4) | follower);
+		msg.tx_status = 0;
+		msg.tx_arb_lost_cnt = 0;
+		msg.tx_nack_cnt = 0;
+		msg.tx_low_drive_cnt = 0;
+		msg.tx_error_cnt = 0;
+		tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
+	}
+	if (tx_ret < 0) {
 		CEC_LOG_ERROR("CEC_TRANSMIT (async) failed: %s", strerror(errno));
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_SENT_FAILED;
