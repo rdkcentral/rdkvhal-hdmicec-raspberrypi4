@@ -546,16 +546,25 @@ static void cec_refresh_logical_address_locked(void)
  * Re-applies initiator mode and re-claims a logical address if needed. */
 static void cec_recover_tx_state_locked(void)
 {
+	CEC_LOG_WARN("TX recovery: Starting (current log_addr=%d, has=%d)",
+	             g_cec_context.logical_address, g_cec_context.has_logical_address);
+
 	__u32 mode = CEC_MODE_INITIATOR | CEC_MODE_EXCL_FOLLOWER_PASSTHROUGH;
 	if (ioctl(g_cec_context.fd, CEC_S_MODE, &mode) < 0) {
-		CEC_LOG_WARN("CEC_S_MODE re-apply failed during TX recovery: %s", strerror(errno));
+		CEC_LOG_WARN("TX recovery: CEC_S_MODE re-apply failed: %s", strerror(errno));
+	} else {
+		CEC_LOG_DEBUG("TX recovery: CEC_S_MODE re-applied successfully");
 	}
 
 	cec_refresh_logical_address_locked();
+	CEC_LOG_WARN("TX recovery: After refresh, log_addr=%d, has=%d",
+	             g_cec_context.logical_address, g_cec_context.has_logical_address);
 	if (g_cec_context.has_logical_address) {
+		CEC_LOG_WARN("TX recovery: Logical address restored, done");
 		return;
 	}
 
+	CEC_LOG_WARN("TX recovery: No logical address after refresh, re-claiming...");
 	struct cec_log_addrs log_addrs;
 	memset(&log_addrs, 0, sizeof(log_addrs));
 	log_addrs.num_log_addrs          = 1;
@@ -568,13 +577,18 @@ static void cec_recover_tx_state_locked(void)
 	log_addrs.all_device_types[0]    = CEC_OP_ALL_DEVTYPE_TUNER;
 
 	if (ioctl(g_cec_context.fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
-		CEC_LOG_WARN("CEC_ADAP_S_LOG_ADDRS failed during TX recovery: %s", strerror(errno));
+		CEC_LOG_WARN("TX recovery: CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(errno));
 		return;
 	}
 
 	cec_refresh_logical_address_locked();
+	CEC_LOG_WARN("TX recovery: After re-claim, log_addr=%d, has=%d",
+	             g_cec_context.logical_address, g_cec_context.has_logical_address);
 	if (g_cec_context.has_logical_address) {
-		CEC_LOG_WARN("Recovered logical address for TX: %d", g_cec_context.logical_address);
+		CEC_LOG_WARN("TX recovery: Successfully recovered logical address %d",
+		             g_cec_context.logical_address);
+	} else {
+		CEC_LOG_WARN("TX recovery: Still no logical address after re-claim");
 	}
 }
 
@@ -1306,13 +1320,14 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.timeout = CEC_TX_TIMEOUT_MS; /* block until ACK/NACK */
-	/* Keep userland compatibility: ignore caller-provided initiator nibble and
-	 * transmit from the adapter's currently allocated logical address. */
-	__u8 follower = (__u8)(buf[0] & 0x0F);
-	__u8 initiator = g_cec_context.has_logical_address ?
+	/* Keep userland compatibility: ignore caller-provided source nibble and
+	 * transmit from the adapter's currently allocated logical address.
+	 * Per RDK HAL spec: header byte = (destination << 4) | source */
+	__u8 destination = (__u8)((buf[0] >> 4) & 0x0F);  /* bits 7-4 */
+	__u8 source = g_cec_context.has_logical_address ?
 		(__u8)(g_cec_context.logical_address & 0x0F) :
 		(__u8)CEC_LOG_ADDR_UNREGISTERED;
-	msg.msg[0] = (__u8)((initiator << 4) | follower);
+	msg.msg[0] = (__u8)((destination << 4) | source);
 	if (len > 1) {
 		memcpy(&msg.msg[1], &buf[1], (size_t)(len - 1));
 	}
@@ -1326,10 +1341,10 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		CEC_LOG_WARN("CEC_TRANSMIT returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
 		             msg.msg[0], len);
 		cec_recover_tx_state_locked();
-		initiator = g_cec_context.has_logical_address ?
+		source = g_cec_context.has_logical_address ?
 			(__u8)(g_cec_context.logical_address & 0x0F) :
 			(__u8)CEC_LOG_ADDR_UNREGISTERED;
-		msg.msg[0] = (__u8)((initiator << 4) | follower);
+		msg.msg[0] = (__u8)((destination << 4) | source);
 		msg.tx_status = 0;
 		msg.tx_arb_lost_cnt = 0;
 		msg.tx_nack_cnt = 0;
@@ -1423,13 +1438,14 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.timeout = 0; /* async: do not wait; tx_status returned via CEC_RECEIVE */
-	/* Keep userland compatibility: ignore caller-provided initiator nibble and
-	 * transmit from the adapter's currently allocated logical address. */
-	__u8 follower = (__u8)(buf[0] & 0x0F);
-	__u8 initiator = g_cec_context.has_logical_address ?
+	/* Keep userland compatibility: ignore caller-provided source nibble and
+	 * transmit from the adapter's currently allocated logical address.
+	 * Per RDK HAL spec: header byte = (destination << 4) | source */
+	__u8 destination = (__u8)((buf[0] >> 4) & 0x0F);  /* bits 7-4 */
+	__u8 source = g_cec_context.has_logical_address ?
 		(__u8)(g_cec_context.logical_address & 0x0F) :
 		(__u8)CEC_LOG_ADDR_UNREGISTERED;
-	msg.msg[0] = (__u8)((initiator << 4) | follower);
+	msg.msg[0] = (__u8)((destination << 4) | source);
 	if (len > 1) {
 		memcpy(&msg.msg[1], &buf[1], (size_t)(len - 1));
 	}
@@ -1443,10 +1459,10 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 		CEC_LOG_WARN("CEC_TRANSMIT (async) returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
 		             msg.msg[0], len);
 		cec_recover_tx_state_locked();
-		initiator = g_cec_context.has_logical_address ?
+		source = g_cec_context.has_logical_address ?
 			(__u8)(g_cec_context.logical_address & 0x0F) :
 			(__u8)CEC_LOG_ADDR_UNREGISTERED;
-		msg.msg[0] = (__u8)((initiator << 4) | follower);
+		msg.msg[0] = (__u8)((destination << 4) | source);
 		msg.tx_status = 0;
 		msg.tx_arb_lost_cnt = 0;
 		msg.tx_nack_cnt = 0;
