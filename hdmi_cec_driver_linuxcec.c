@@ -52,7 +52,9 @@
 #define GIT_COMMIT_SHA "unknown"
 #endif
 
+#ifndef CEC_MAX_MSG_SIZE
 #define CEC_MAX_MSG_SIZE        16
+#endif
 
 /* CEC_DEV_NODE is the full CEC device node path, injected at compile time
  * via -DCEC_DEV_NODE="/dev/cecN".  Default is /dev/cec0 (HDMI0).
@@ -347,6 +349,9 @@ static cec_context_t g_cec_context = {
 	.has_logical_address = false,
 	.callback_active  = 0
 };
+
+/* Must be called with g_cec_context.mutex held. */
+static void cec_refresh_logical_address_locked(void);
 
 /*
  * Receive thread: blocks on poll() multiplexed between the CEC device fd

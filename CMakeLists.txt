@@ -14,6 +14,16 @@ set(SRCS hdmi_cec_driver_linuxcec.c)
 set(CEC_DEV_NODE "/dev/cec0" CACHE STRING "CEC device node path (e.g. /dev/cec0 for HDMI0, /dev/cec1 for HDMI1)")
 message(STATUS "CEC device node: ${CEC_DEV_NODE}")
 
+# CEC identity/profile defaults; override for other platforms/devices.
+# NOTE: 0x00BC44 is the Raspberry Pi/Broadcom-specific default OUI used by this repo.
+# Override CEC_VENDOR_ID for non-RPi/non-Broadcom products.
+set(CEC_VENDOR_ID "0x00BC44" CACHE STRING "CEC vendor ID (24-bit hex, e.g. 0x0019FB)")
+set(CEC_PRIMARY_DEVICE_TYPE "CEC_OP_PRIM_DEVTYPE_TUNER" CACHE STRING "Primary CEC device type macro")
+set(CEC_LOG_ADDR_TYPE "CEC_LOG_ADDR_TYPE_TUNER" CACHE STRING "CEC logical address type macro")
+set(CEC_ALL_DEVICE_TYPE "CEC_OP_ALL_DEVTYPE_TUNER" CACHE STRING "CEC all-device type macro")
+message(STATUS "CEC vendor id: ${CEC_VENDOR_ID}")
+message(STATUS "CEC profile: primary=${CEC_PRIMARY_DEVICE_TYPE}, log_addr=${CEC_LOG_ADDR_TYPE}, all=${CEC_ALL_DEVICE_TYPE}")
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
     set(CMAKE_BUILD_TYPE "${DEFAULT_BUILD_TYPE}" CACHE STRING "Choose the type of build." FORCE)
@@ -63,6 +73,10 @@ target_compile_definitions(${LIBNAME} PRIVATE
     HAL_VERSION="${PROJECT_VERSION}"
     GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
     CEC_DEV_NODE="${CEC_DEV_NODE}"
+    CEC_VENDOR_ID=${CEC_VENDOR_ID}
+    CEC_PRIMARY_DEVICE_TYPE=${CEC_PRIMARY_DEVICE_TYPE}
+    CEC_LOG_ADDR_TYPE=${CEC_LOG_ADDR_TYPE}
+    CEC_ALL_DEVICE_TYPE=${CEC_ALL_DEVICE_TYPE}
 )
 
 add_custom_target(clean-all
