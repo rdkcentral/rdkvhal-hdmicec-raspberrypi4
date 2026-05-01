@@ -295,7 +295,7 @@ static int cec_generate_handle(void)
 	}
 }
 
-void trace_hexdump(const uint8_t *buf, size_t len)
+static void trace_hexdump(const uint8_t *buf, size_t len)
 {
 	if (buf == NULL || len == 0 || g_log_level < CEC_LOG_LEVEL_TRACE)
 		return;
@@ -688,7 +688,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 {
 	if (handle == NULL) {
 		CEC_LOG_ERROR("Invalid argument: handle is NULL");
-		return HDMI_CEC_IO_INVALID_ARGUMENT;
+		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
 	pthread_mutex_lock(&g_cec_context.mutex);
