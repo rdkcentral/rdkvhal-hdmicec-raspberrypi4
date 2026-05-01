@@ -349,7 +349,7 @@ static void *cec_rx_thread(void *arg)
 		 * causes buffer overflow when fd >= FD_SETSIZE (1024). */
 		struct pollfd pfds[2];
 		pfds[0].fd     = ctx->fd;
-		pfds[0].events = POLLIN;
+		pfds[0].events = POLLIN | POLLPRI; /* POLLPRI wakes on CEC_EVENT_STATE_CHANGE */
 		pfds[1].fd     = ctx->pipe_rd;
 		pfds[1].events = POLLIN;
 
@@ -370,6 +370,22 @@ static void *cec_rx_thread(void *arg)
 		if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
 			CEC_LOG_ERROR("CEC device poll error: revents=0x%x", pfds[0].revents);
 			break;
+		}
+
+		/* CEC_EVENT_STATE_CHANGE: physical/logical address changed (hotplug, etc.) */
+		if (pfds[0].revents & POLLPRI) {
+			struct cec_event ev;
+			memset(&ev, 0, sizeof(ev));
+			if (ioctl(ctx->fd, CEC_DQEVENT, &ev) == 0 &&
+			    ev.event == CEC_EVENT_STATE_CHANGE) {
+				pthread_mutex_lock(&ctx->mutex);
+				__u16 new_phys = ev.state_change.phys_addr;
+				ctx->physical_address = new_phys;
+				cec_refresh_logical_address_locked();
+				CEC_LOG_INFO("State change event: phys_addr=0x%04x, log_addr=%d",
+				             new_phys, ctx->logical_address);
+				pthread_mutex_unlock(&ctx->mutex);
+			}
 		}
 
 		if (!(pfds[0].revents & POLLIN))
