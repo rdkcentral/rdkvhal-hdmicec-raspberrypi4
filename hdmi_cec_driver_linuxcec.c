@@ -295,6 +295,30 @@ static int cec_generate_handle(void)
 	}
 }
 
+static bool cec_is_allowed_device_path(const char *path)
+{
+	static const char prefix[] = "/dev/cec";
+	size_t prefix_len = sizeof(prefix) - 1;
+
+	if (path == NULL || strncmp(path, prefix, prefix_len) != 0) {
+		return false;
+	}
+
+	path += prefix_len;
+	if (*path == '\0') {
+		return false;
+	}
+
+	while (*path != '\0') {
+		if (*path < '0' || *path > '9') {
+			return false;
+		}
+		path++;
+	}
+
+	return true;
+}
+
 static void trace_hexdump(const uint8_t *buf, size_t len)
 {
 	if (buf == NULL || len == 0 || g_log_level < CEC_LOG_LEVEL_TRACE)
@@ -479,7 +503,7 @@ static void *cec_rx_thread(void *arg)
 			}
 
 			CEC_LOG_INFO("Received CEC message: len=%u", (unsigned int)msg.len);
-			// dump the message being sent for debugging.
+			// dump the message being received for debugging.
 			trace_hexdump(msg.msg, (size_t)msg.len);
 		}
 	}
@@ -700,10 +724,17 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 		return HDMI_CEC_IO_ALREADY_OPEN;
 	}
 
-	/* Allow device path override via environment variable */
-	const char *dev_path = getenv("CEC_HAL_DEVICE");
-	if (dev_path == NULL)
-		dev_path = CEC_DEVICE_PATH_DEFAULT;
+	/* Allow device path override via environment variable, but only for
+	 * known-safe /dev/cecN-style nodes to avoid opening arbitrary devices. */
+	const char *dev_path = CEC_DEVICE_PATH_DEFAULT;
+	const char *env_dev_path = getenv("CEC_HAL_DEVICE");
+	if (env_dev_path != NULL) {
+		if (cec_is_allowed_device_path(env_dev_path)) {
+			dev_path = env_dev_path;
+		} else {
+			CEC_LOG_WARN("Ignoring unsafe CEC_HAL_DEVICE override: %s", env_dev_path);
+		}
+	}
 
 	/* Enforce singleton: one HAL instance per CEC device node across all processes.
 	 * An exclusive non-blocking flock on a well-known lock file achieves this.
@@ -1095,7 +1126,7 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int *physicalAddr
 	 * even if HDMI was disconnected/reconnected after HdmiCecOpen. */
 	__u16 phys_addr = CEC_PHYS_ADDR_INVALID;
 	if (ioctl(g_cec_context.fd, CEC_ADAP_G_PHYS_ADDR, &phys_addr) < 0) {
-		CEC_LOG_WARN("CEC_ADAP_G_PHYS_ADDR failed: %s — returning cached value",
+		CEC_LOG_WARN("CEC_ADAP_G_PHYS_ADDR failed: %s - returning cached value",
 		             strerror(errno));
 		phys_addr = g_cec_context.physical_address;
 	} else {
@@ -1611,7 +1642,7 @@ static void __attribute__((destructor)) cec_driver_term(void)
 	if (lock_result != 0) {
 		/* Mutex acquisition timed out — skip all cleanup to avoid undefined
 		 * behaviour and rely on the OS to reclaim resources. */
-		fprintf(stderr, "RPiCECHAL: Error - mutex timeout during shutdown, skipping cleanup.\n");
+		fprintf(stderr, "RPICECHAL: Error - mutex timeout during shutdown, skipping cleanup.\n");
 		return;
 	}
 
