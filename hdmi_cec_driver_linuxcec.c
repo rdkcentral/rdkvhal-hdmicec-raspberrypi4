@@ -645,7 +645,6 @@ static void cec_recover_tx_state_locked(void)
 	log_addrs.cec_version            = CEC_OP_CEC_VERSION_1_4;
 	log_addrs.vendor_id              = RPI_CEC_VENDOR_ID;
 	log_addrs.flags                  = CEC_LOG_ADDRS_FL_ALLOW_UNREG_FALLBACK;
-	strncpy(log_addrs.osd_name, "RDK-STB", sizeof(log_addrs.osd_name) - 1);
 	log_addrs.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_TUNER;
 	log_addrs.log_addr_type[0]       = CEC_LOG_ADDR_TYPE_TUNER;
 	log_addrs.all_device_types[0]    = CEC_OP_ALL_DEVTYPE_TUNER;
@@ -790,7 +789,6 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	log_addrs.cec_version            = CEC_OP_CEC_VERSION_1_4;
 	log_addrs.vendor_id              = RPI_CEC_VENDOR_ID;
 	log_addrs.flags                  = CEC_LOG_ADDRS_FL_ALLOW_UNREG_FALLBACK;
-	strncpy(log_addrs.osd_name, "RDK-STB", sizeof(log_addrs.osd_name) - 1);
 	log_addrs.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_TUNER;
 	log_addrs.log_addr_type[0]       = CEC_LOG_ADDR_TYPE_TUNER;
 	log_addrs.all_device_types[0]    = CEC_OP_ALL_DEVTYPE_TUNER;
