@@ -70,8 +70,22 @@
 #define CEC_TIMESTAMP_FALLBACK  "_TIMESTAMP_UNAVAILABLE_"
 #define CEC_TIMESTAMP_SIZE      64
 
-/* Raspberry Pi CEC Configuration */
-#define RPI_CEC_VENDOR_ID       0x00BC44
+/* CEC identity/profile defaults; override via CMake compile definitions. */
+#ifndef CEC_VENDOR_ID
+#define CEC_VENDOR_ID           0x00BC44
+#endif
+
+#ifndef CEC_PRIMARY_DEVICE_TYPE
+#define CEC_PRIMARY_DEVICE_TYPE CEC_OP_PRIM_DEVTYPE_TUNER
+#endif
+
+#ifndef CEC_LOG_ADDR_TYPE
+#define CEC_LOG_ADDR_TYPE       CEC_LOG_ADDR_TYPE_TUNER
+#endif
+
+#ifndef CEC_ALL_DEVICE_TYPE
+#define CEC_ALL_DEVICE_TYPE     CEC_OP_ALL_DEVTYPE_TUNER
+#endif
 
 /* Blocking TX: wait up to 1000 ms for ACK/NACK */
 #define CEC_TX_TIMEOUT_MS       1000
@@ -643,11 +657,11 @@ static void cec_recover_tx_state_locked(void)
 	memset(&log_addrs, 0, sizeof(log_addrs));
 	log_addrs.num_log_addrs          = 1;
 	log_addrs.cec_version            = CEC_OP_CEC_VERSION_1_4;
-	log_addrs.vendor_id              = RPI_CEC_VENDOR_ID;
+	log_addrs.vendor_id              = CEC_VENDOR_ID;
 	log_addrs.flags                  = CEC_LOG_ADDRS_FL_ALLOW_UNREG_FALLBACK;
-	log_addrs.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_TUNER;
-	log_addrs.log_addr_type[0]       = CEC_LOG_ADDR_TYPE_TUNER;
-	log_addrs.all_device_types[0]    = CEC_OP_ALL_DEVTYPE_TUNER;
+	log_addrs.primary_device_type[0] = CEC_PRIMARY_DEVICE_TYPE;
+	log_addrs.log_addr_type[0]       = CEC_LOG_ADDR_TYPE;
+	log_addrs.all_device_types[0]    = CEC_ALL_DEVICE_TYPE;
 
 	if (ioctl(g_cec_context.fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
 		CEC_LOG_WARN("TX recovery: CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(errno));
@@ -787,11 +801,11 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	memset(&log_addrs, 0, sizeof(log_addrs));
 	log_addrs.num_log_addrs          = 1;
 	log_addrs.cec_version            = CEC_OP_CEC_VERSION_1_4;
-	log_addrs.vendor_id              = RPI_CEC_VENDOR_ID;
+	log_addrs.vendor_id              = CEC_VENDOR_ID;
 	log_addrs.flags                  = CEC_LOG_ADDRS_FL_ALLOW_UNREG_FALLBACK;
-	log_addrs.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_TUNER;
-	log_addrs.log_addr_type[0]       = CEC_LOG_ADDR_TYPE_TUNER;
-	log_addrs.all_device_types[0]    = CEC_OP_ALL_DEVTYPE_TUNER;
+	log_addrs.primary_device_type[0] = CEC_PRIMARY_DEVICE_TYPE;
+	log_addrs.log_addr_type[0]       = CEC_LOG_ADDR_TYPE;
+	log_addrs.all_device_types[0]    = CEC_ALL_DEVICE_TYPE;
 
 	/* This ioctl blocks until the logical address claiming process completes */
 	if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
