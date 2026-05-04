@@ -1567,20 +1567,19 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		*result = HDMI_CEC_IO_SENT_FAILED;
 	}
 
-	/* Do not fire tx_callback inline here. The rx_thread will deliver the TX
-	 * completion event when CEC_RECEIVE returns a message with tx_status set.
-	 * Firing it synchronously from HdmiCecTx would: (a) double-invoke the callback
-	 * (rx_thread fires it again for the same event), and (b) deadlock if the
-	 * callback calls HdmiCecClose() — Close waits for callback_active==0, which
-	 * can't happen until the callback returns. The caller already has the outcome
-	 * in *result; tx_callback is notified asynchronously via the rx_thread. */
+	/* HdmiCecTx() is the blocking transmit path: completion for this call is
+	 * reported synchronously via *result based on msg.tx_status returned from
+	 * CEC_TRANSMIT. Do not fire tx_callback inline here: doing so would risk
+	 * deadlock if the callback calls HdmiCecClose(), and some drivers may still
+	 * surface TX state asynchronously. Callers that require tx_callback delivery
+	 * must use the asynchronous transmit path; synchronous callers must use
+	 * *result as the completion status. */
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	/* Return value: preserve prior observable behavior for callers that check the return code.
-	 * For backward compatibility with the userland implementation, return SENT_FAILED only for
-	 * actual transmit failures (i.e., when *result == HDMI_CEC_IO_SENT_FAILED, such as
-	 * collision/arb-lost). ACK and NACK outcomes are reported via *result and tx_callback,
-	 * while this function still returns HDMI_CEC_IO_SUCCESS for those cases. */
+	 * Return SENT_FAILED only for actual transmit failures (e.g., arbitration lost,
+	 * collision/arb-lost). ACK and NACK outcomes for this synchronous path are
+	 * reported via *result while this function still returns HDMI_CEC_IO_SUCCESS. */
 	if (*result == HDMI_CEC_IO_SENT_FAILED)
 		return HDMI_CEC_IO_SENT_FAILED;
 	return HDMI_CEC_IO_SUCCESS;
