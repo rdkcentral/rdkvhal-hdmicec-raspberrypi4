@@ -944,9 +944,10 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	g_cec_context.initialized      = true;
 	g_cec_context.running          = true;
 
-	if (pthread_create(&g_cec_context.rx_thread, NULL,
-	                   cec_rx_thread, &g_cec_context) != 0) {
-		CEC_LOG_ERROR("pthread_create failed: %s", strerror(errno));
+	int thread_create_ret = pthread_create(&g_cec_context.rx_thread, NULL,
+	                                       cec_rx_thread, &g_cec_context);
+	if (thread_create_ret != 0) {
+		CEC_LOG_ERROR("pthread_create failed: %s", strerror(thread_create_ret));
 		close(pipefd[0]);
 		close(pipefd[1]);
 		close(fd);
@@ -1763,7 +1764,21 @@ static void __attribute__((destructor)) cec_driver_term(void)
 		pthread_join(rx_thread_to_join, NULL);
 	}
 
-	pthread_mutex_lock(&g_cec_context.mutex);
+	/* Reacquire mutex with timeout to ensure cleanup proceeds even if another
+	 * thread holds the lock. */
+	if (clock_gettime(CLOCK_REALTIME, &timeout) == 0) {
+		timeout.tv_sec += CEC_MUTEX_TIMEOUT_SEC;
+	} else {
+		timeout.tv_sec  = time(NULL) + CEC_MUTEX_TIMEOUT_SEC;
+		timeout.tv_nsec = 0;
+	}
+	lock_result = pthread_mutex_timedlock(&g_cec_context.mutex, &timeout);
+	if (lock_result != 0) {
+		/* Second mutex acquisition timed out — skip cleanup of FDs and state
+		 * to avoid potential race; rely on OS to reclaim resources at process exit. */
+		fprintf(stderr, "RPICECHAL: Error - mutex timeout during cleanup phase, skipping FD close.\n");
+		return;
+	}
 	if (need_join) {
 		g_cec_context.rx_thread_running = false;
 		g_cec_context.rx_thread_created = false;
