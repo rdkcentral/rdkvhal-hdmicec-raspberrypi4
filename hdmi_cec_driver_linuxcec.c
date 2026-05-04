@@ -1321,7 +1321,7 @@ HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int *logicalAddress)
  *     (ref <HDMI Specification 1-4> Section <CEC 6.1>) :
  *
  * complete message  = header block + data block@n
- * header block     = destination logical address (4-bit) + source address (4-bit)@n
+ * header block     = source logical address (4-bit) + destination logical address (4-bit)@n
  * data block       = opcode block (8-bit) + operand block (N-bytes)
  *
  * @code
@@ -1330,7 +1330,7 @@ HDMI_CEC_STATUS HdmiCecGetLogicalAddress(int handle, int *logicalAddress)
  * |------------------------------------------------
  * |3|2|1|0|3|2|1|0|7|6|5|4|3|2|1|0|7|6|5|4|3|2|1|0|
  * |------------------------------------------------
- * | Dest  |  src  |  opcode block | operand block |
+ * |  src  | Dest  |  opcode block | operand block |
  * |------------------------------------------------
  * @endcode
  *
