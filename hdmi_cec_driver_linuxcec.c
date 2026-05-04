@@ -121,6 +121,7 @@ typedef struct {
 	int pipe_wr;                  /* write end of shutdown pipe for rx_thread */
 	int lock_fd;                  /* singleton flock() lock file descriptor */
 	pthread_t rx_thread;
+	bool rx_thread_created;
 	bool rx_thread_running;
 	bool deferred_cleanup;
 	bool closing;
@@ -357,6 +358,7 @@ static cec_context_t g_cec_context = {
 	.pipe_rd          = -1,
 	.pipe_wr          = -1,
 	.lock_fd          = -1,
+	.rx_thread_created = false,
 	.rx_thread_running = false,
 	.deferred_cleanup = false,
 	.closing          = false,
@@ -921,11 +923,13 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 		g_cec_context.lock_fd     = -1;
 		g_cec_context.pipe_rd     = -1;
 		g_cec_context.pipe_wr     = -1;
+		g_cec_context.rx_thread_created = false;
 		g_cec_context.initialized = false;
 		g_cec_context.running     = false;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
+	g_cec_context.rx_thread_created = true;
 	g_cec_context.rx_thread_running = true;
 	g_cec_context.deferred_cleanup = false;
 	g_cec_context.closing = false;
@@ -977,6 +981,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	/* Self-close from within rx_thread callback cannot join itself. */
 	bool close_from_rx_thread = g_cec_context.rx_thread_running &&
 	                           pthread_equal(pthread_self(), g_cec_context.rx_thread);
+	bool rx_thread_created = g_cec_context.rx_thread_created;
 	bool rx_thread_was_running = g_cec_context.rx_thread_running;
 	pthread_t rx_thread = g_cec_context.rx_thread;
 	int pipe_wr = g_cec_context.pipe_wr;
@@ -992,18 +997,20 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
-	/* Signal rx_thread to exit then reap it */
-	if (rx_thread_was_running) {
+	/* Signal rx_thread to exit then reap it if it was created and we're not that thread. */
+	if (rx_thread_created && !close_from_rx_thread) {
 		char byte = 1;
-		(void)write(pipe_wr, &byte, 1);
-		if (!close_from_rx_thread) {
-			pthread_join(rx_thread, NULL);
-			pthread_mutex_lock(&g_cec_context.mutex);
-			g_cec_context.rx_thread_running = false;
-			pthread_mutex_unlock(&g_cec_context.mutex);
-		} else {
-			CEC_LOG_INFO("HdmiCecClose invoked from rx_thread; deferring FD cleanup to thread exit");
+		if (rx_thread_was_running && pipe_wr >= 0) {
+			(void)write(pipe_wr, &byte, 1);
 		}
+		pthread_join(rx_thread, NULL);
+		pthread_mutex_lock(&g_cec_context.mutex);
+		g_cec_context.rx_thread_running = false;
+		g_cec_context.rx_thread_created = false;
+		g_cec_context.rx_thread = (pthread_t)0;
+		pthread_mutex_unlock(&g_cec_context.mutex);
+	} else if (close_from_rx_thread) {
+		CEC_LOG_INFO("HdmiCecClose invoked from rx_thread; deferring FD cleanup to thread exit");
 	}
 
 	if (close_from_rx_thread) {
@@ -1061,6 +1068,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	g_cec_context.lock_fd = -1;
 
 	g_cec_context.handle              = 0;
+	g_cec_context.rx_thread_created   = false;
 	g_cec_context.rx_callback         = NULL;
 	g_cec_context.rx_callback_data    = NULL;
 	g_cec_context.tx_callback         = NULL;
@@ -1659,23 +1667,27 @@ static void __attribute__((destructor)) cec_driver_term(void)
 	if (g_cec_context.rx_thread_running || g_cec_context.deferred_cleanup || g_cec_context.closing) {
 		need_cleanup = true;
 	}
-	if (g_cec_context.rx_thread_running) {
+	if (g_cec_context.rx_thread_created) {
 		need_join = true;
 		rx_thread_to_join = g_cec_context.rx_thread;
 	}
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
-	/* Signal and join rx_thread even if initialized is already false. */
+	/* Signal and join rx_thread even if it already exited but has not yet been joined. */
 	if (need_join) {
 		char byte = 1;
-		(void)write(pipe_wr, &byte, 1);
+		if (pipe_wr >= 0) {
+			(void)write(pipe_wr, &byte, 1);
+		}
 		pthread_join(rx_thread_to_join, NULL);
 	}
 
 	pthread_mutex_lock(&g_cec_context.mutex);
 	if (need_join) {
 		g_cec_context.rx_thread_running = false;
+		g_cec_context.rx_thread_created = false;
+		g_cec_context.rx_thread = (pthread_t)0;
 	}
 
 	if (need_cleanup) {
