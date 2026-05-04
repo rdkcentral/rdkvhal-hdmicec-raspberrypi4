@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <sys/syscall.h>
 #include <poll.h>
 #include <stdarg.h>
 
@@ -901,36 +902,52 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 
 	/* Create self-pipe for clean rx_thread shutdown */
 	int pipefd[2];
-	if (pipe(pipefd) < 0) {
-		CEC_LOG_ERROR("pipe() failed: %s", strerror(errno));
+	bool pipe_created = false;
+
+	/* Prefer atomic CLOEXEC to avoid fork/exec races in multi-threaded processes. */
+#if defined(__linux__) && defined(SYS_pipe2) && defined(O_CLOEXEC)
+	if (syscall(SYS_pipe2, pipefd, O_CLOEXEC) == 0) {
+		pipe_created = true;
+	} else if (errno != ENOSYS) {
+		CEC_LOG_ERROR("pipe2(O_CLOEXEC) failed: %s", strerror(errno));
 		close(fd);
 		close(lock_fd);
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
+#endif
 
-	/* Set close-on-exec on pipe read end to prevent descriptor leaks into child processes */
-	int pipe_rd_flags = fcntl(pipefd[0], F_GETFD);
-	if (pipe_rd_flags < 0 || fcntl(pipefd[0], F_SETFD, pipe_rd_flags | FD_CLOEXEC) < 0) {
-		CEC_LOG_ERROR("fcntl(FD_CLOEXEC) failed for pipe read end: %s", strerror(errno));
-		close(pipefd[0]);
-		close(pipefd[1]);
-		close(fd);
-		close(lock_fd);
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_GENERAL_ERROR;
-	}
+	if (!pipe_created) {
+		if (pipe(pipefd) < 0) {
+			CEC_LOG_ERROR("pipe() failed: %s", strerror(errno));
+			close(fd);
+			close(lock_fd);
+			pthread_mutex_unlock(&g_cec_context.mutex);
+			return HDMI_CEC_IO_GENERAL_ERROR;
+		}
 
-	/* Set close-on-exec on pipe write end */
-	int pipe_wr_flags = fcntl(pipefd[1], F_GETFD);
-	if (pipe_wr_flags < 0 || fcntl(pipefd[1], F_SETFD, pipe_wr_flags | FD_CLOEXEC) < 0) {
-		CEC_LOG_ERROR("fcntl(FD_CLOEXEC) failed for pipe write end: %s", strerror(errno));
-		close(pipefd[0]);
-		close(pipefd[1]);
-		close(fd);
-		close(lock_fd);
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_GENERAL_ERROR;
+		/* Fallback for platforms without pipe2(O_CLOEXEC). */
+		int pipe_rd_flags = fcntl(pipefd[0], F_GETFD);
+		if (pipe_rd_flags < 0 || fcntl(pipefd[0], F_SETFD, pipe_rd_flags | FD_CLOEXEC) < 0) {
+			CEC_LOG_ERROR("fcntl(FD_CLOEXEC) failed for pipe read end: %s", strerror(errno));
+			close(pipefd[0]);
+			close(pipefd[1]);
+			close(fd);
+			close(lock_fd);
+			pthread_mutex_unlock(&g_cec_context.mutex);
+			return HDMI_CEC_IO_GENERAL_ERROR;
+		}
+
+		int pipe_wr_flags = fcntl(pipefd[1], F_GETFD);
+		if (pipe_wr_flags < 0 || fcntl(pipefd[1], F_SETFD, pipe_wr_flags | FD_CLOEXEC) < 0) {
+			CEC_LOG_ERROR("fcntl(FD_CLOEXEC) failed for pipe write end: %s", strerror(errno));
+			close(pipefd[0]);
+			close(pipefd[1]);
+			close(fd);
+			close(lock_fd);
+			pthread_mutex_unlock(&g_cec_context.mutex);
+			return HDMI_CEC_IO_GENERAL_ERROR;
+		}
 	}
 
 	g_cec_context.fd               = fd;
