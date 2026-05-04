@@ -983,12 +983,11 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 
 	g_cec_context.closing     = true;
 	g_cec_context.running     = false;
+	g_cec_context.initialized = false;
 	if (close_from_rx_thread) {
 		/* Keep logically open until deferred cleanup completes so Open()
 		 * cannot race and overwrite the context while rx_thread exits. */
 		g_cec_context.deferred_cleanup = true;
-	} else {
-		g_cec_context.initialized = false;
 	}
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
@@ -1034,15 +1033,15 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (callbacks_timed_out) {
-		/* Close did not complete cleanly. Restore the instance to a fully consistent
-		 * open state so the caller can retry HdmiCecClose() using the same handle.
-		 * running must also be restored (not just initialized/closing) so the context
-		 * is self-consistent: initialized+running+FDs open but rx_thread already
-		 * joined.  A retry call to Close will skip the join (rx_thread_running==false)
+		/* Close did not complete cleanly. Keep enough state for the caller to retry
+		 * HdmiCecClose() using the same handle, but do not mark the context as
+		 * fully operational: the RX thread has already been joined or is not
+		 * running, so RX callbacks and async TX completion cannot be serviced.
+		 * A retry call to Close will skip the join (rx_thread_running==false)
 		 * and only wait for the remaining callbacks to quiesce. */
 		pthread_mutex_lock(&g_cec_context.mutex);
 		g_cec_context.initialized = true;
-		g_cec_context.running     = true;
+		g_cec_context.running     = false;
 		g_cec_context.closing     = false;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		CEC_LOG_ERROR("Timed out waiting for %d active callback(s) during close", callbacks_left);
