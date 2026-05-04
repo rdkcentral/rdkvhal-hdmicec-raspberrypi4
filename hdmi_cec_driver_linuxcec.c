@@ -533,6 +533,8 @@ static void *cec_rx_thread(void *arg)
 		ctx->deferred_cleanup    = false;
 		ctx->closing             = false;
 		ctx->initialized         = false;
+		ctx->rx_thread_created   = false;
+		ctx->rx_thread           = (pthread_t)0;
 	} else {
 		/* Unexpected thread exit (poll error / device error) without deferred_cleanup.
 		 * Mark the context as no longer running so callers can detect the failure:
