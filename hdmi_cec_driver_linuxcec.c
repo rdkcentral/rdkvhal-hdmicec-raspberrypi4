@@ -1081,16 +1081,19 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (callbacks_timed_out) {
-		/* Close did not complete cleanly. Keep enough state for the caller to retry
-		 * HdmiCecClose() using the same handle, but do not mark the context as
-		 * fully operational: the RX thread has already been joined or is not
-		 * running, so RX callbacks and async TX completion cannot be serviced.
+		/* Close did not complete cleanly.
+		 * Keep closing=true so HdmiCecClose() can be retried with the same handle:
+		 * the entry guard (!initialized && !closing) passes when closing==true.
+		 * Keep initialized=false so every other public API (HdmiCecTx,
+		 * HdmiCecGetPhysicalAddress, HdmiCecSet*Callback, …) rejects calls with
+		 * HDMI_CEC_IO_NOT_OPENED — the RX thread is already joined, so no async
+		 * TX completion callbacks or state-change handling can be serviced.
 		 * A retry call to Close will skip the join (rx_thread_running==false)
 		 * and only wait for the remaining callbacks to quiesce. */
 		pthread_mutex_lock(&g_cec_context.mutex);
-		g_cec_context.initialized = true;
+		g_cec_context.initialized = false;
 		g_cec_context.running     = false;
-		g_cec_context.closing     = false;
+		g_cec_context.closing     = true;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		CEC_LOG_ERROR("Timed out waiting for %d active callback(s) during close", callbacks_left);
 		return HDMI_CEC_IO_GENERAL_ERROR;
