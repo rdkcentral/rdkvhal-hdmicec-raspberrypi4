@@ -4,6 +4,9 @@ cmake_minimum_required(VERSION 3.10)
 # RCECHal version
 project(RCECHal VERSION 1.4.0 LANGUAGES C)
 
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 set(LIBNAME RCECHal)
 set(DEFAULT_BUILD_TYPE "Release")
 

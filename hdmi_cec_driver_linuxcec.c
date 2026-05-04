@@ -1606,26 +1606,22 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 			/* Preserve poll behavior symmetry with HdmiCecTx: poll EINVAL means
 			 * not-acknowledged (listener could not be found or did not respond).
 			 * Synthesize tx_callback completion to maintain async API contract:
-			 * callers must be notified of result (they cannot infer from return value). */
+			 * callers must be notified of result (they cannot infer from return value).
+			 *
+			 * Invoke the callback from local snapshots after releasing the mutex,
+			 * but do not hold callback_active across this inline call: if the
+			 * callback re-enters HdmiCecClose(), Close may wait for
+			 * callback_active to reach 0, which would deadlock until this
+			 * callback returns. */
 			cec_log_poll_einval_rate_limited_locked(msg.msg[0]);
 
 			HdmiCecTxCallback_t tx_callback = g_cec_context.tx_callback;
 			void *tx_callback_data = g_cec_context.tx_callback_data;
 			int callback_handle = g_cec_context.handle;
-			if (tx_callback != NULL) {
-				g_cec_context.callback_active++;
-			}
 			pthread_mutex_unlock(&g_cec_context.mutex);
 
 			if (tx_callback != NULL) {
 				tx_callback(callback_handle, tx_callback_data, HDMI_CEC_IO_SENT_BUT_NOT_ACKD);
-				pthread_mutex_lock(&g_cec_context.mutex);
-				if (g_cec_context.callback_active > 0) {
-					g_cec_context.callback_active--;
-				} else {
-					CEC_LOG_WARN("callback_active already 0 after tx poll callback");
-				}
-				pthread_mutex_unlock(&g_cec_context.mutex);
 			}
 			return HDMI_CEC_IO_SUCCESS;
 		}
