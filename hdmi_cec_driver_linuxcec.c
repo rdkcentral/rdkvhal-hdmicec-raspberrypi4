@@ -142,8 +142,38 @@ typedef struct {
 static FILE *g_log_file = NULL;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t g_log_init_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_callback_tls_key;
+static pthread_once_t g_callback_tls_once = PTHREAD_ONCE_INIT;
+static int g_callback_tls_init_status = EINVAL;
 static int g_log_level = CEC_LOG_LEVEL_WARN;
 static unsigned int g_poll_einval_suppressed = 0;
+
+static void cec_callback_tls_init_impl(void)
+{
+	g_callback_tls_init_status = pthread_key_create(&g_callback_tls_key, NULL);
+}
+
+static bool cec_callback_tls_ready(void)
+{
+	pthread_once(&g_callback_tls_once, cec_callback_tls_init_impl);
+	return (g_callback_tls_init_status == 0);
+}
+
+static void cec_set_in_callback_context(bool in_callback)
+{
+	if (!cec_callback_tls_ready()) {
+		return;
+	}
+	(void)pthread_setspecific(g_callback_tls_key, in_callback ? (void *)1 : NULL);
+}
+
+static bool cec_is_in_callback_context(void)
+{
+	if (!cec_callback_tls_ready()) {
+		return false;
+	}
+	return pthread_getspecific(g_callback_tls_key) != NULL;
+}
 
 static void cec_get_timestamp(char *buffer, size_t size)
 {
@@ -1030,8 +1060,9 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	/* Wait for in-progress callbacks before teardown, but keep shutdown bounded.
 	 * On timeout, surface an error and leave state open for a later retry. */
 	pthread_mutex_lock(&g_cec_context.mutex);
+	int self_callback_bias = cec_is_in_callback_context() ? 1 : 0;
 	int wait_count = 0;
-	while (g_cec_context.callback_active > 0 &&
+	while (g_cec_context.callback_active > self_callback_bias &&
 	       wait_count < CEC_CLOSE_MAX_WAIT_ITERATIONS) {
 		bool should_log = (wait_count == 0);
 		int active_callbacks = g_cec_context.callback_active;
@@ -1045,7 +1076,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 		wait_count++;
 	}
 	int callbacks_left = g_cec_context.callback_active;
-	bool callbacks_timed_out = (callbacks_left > 0);
+	bool callbacks_timed_out = (callbacks_left > self_callback_bias);
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
 	if (callbacks_timed_out) {
@@ -1064,8 +1095,9 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 		return HDMI_CEC_IO_GENERAL_ERROR;
 	}
 
-	/* Release CEC resources. callback_active is now guaranteed to be 0,
-	 * so no callback will access these FDs or the context structure. */
+	/* Release CEC resources. All callbacks from other threads are quiesced.
+	 * If Close is called re-entrantly from a callback, the current callback
+	 * may still be in progress on this thread. */
 	pthread_mutex_lock(&g_cec_context.mutex);
 	close(g_cec_context.pipe_wr);
 	close(g_cec_context.pipe_rd);
@@ -1608,20 +1640,42 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 			 * Synthesize tx_callback completion to maintain async API contract:
 			 * callers must be notified of result (they cannot infer from return value).
 			 *
-			 * Invoke the callback from local snapshots after releasing the mutex,
-			 * but do not hold callback_active across this inline call: if the
-			 * callback re-enters HdmiCecClose(), Close may wait for
-			 * callback_active to reach 0, which would deadlock until this
-			 * callback returns. */
+			 * Account for this inline completion in callback_active so shutdown
+			 * can wait for in-flight callback execution from other threads.
+			 * Close re-entry from this same callback thread is handled by
+			 * cec_is_in_callback_context() bias in HdmiCecClose(). */
 			cec_log_poll_einval_rate_limited_locked(msg.msg[0]);
 
-			HdmiCecTxCallback_t tx_callback = g_cec_context.tx_callback;
-			void *tx_callback_data = g_cec_context.tx_callback_data;
-			int callback_handle = g_cec_context.handle;
+			HdmiCecTxCallback_t tx_callback = NULL;
+			void *tx_callback_data = NULL;
+			int callback_handle = 0;
+			bool invoke_callback = false;
+			if (g_cec_context.running && !g_cec_context.closing &&
+			    g_cec_context.initialized && g_cec_context.tx_callback != NULL) {
+				tx_callback = g_cec_context.tx_callback;
+				tx_callback_data = g_cec_context.tx_callback_data;
+				callback_handle = g_cec_context.handle;
+				g_cec_context.callback_active++;
+				invoke_callback = true;
+			}
 			pthread_mutex_unlock(&g_cec_context.mutex);
 
-			if (tx_callback != NULL) {
+			if (invoke_callback) {
+				cec_set_in_callback_context(true);
 				tx_callback(callback_handle, tx_callback_data, HDMI_CEC_IO_SENT_BUT_NOT_ACKD);
+				cec_set_in_callback_context(false);
+
+				bool callback_active_underflow = false;
+				pthread_mutex_lock(&g_cec_context.mutex);
+				if (g_cec_context.callback_active > 0) {
+					g_cec_context.callback_active--;
+				} else {
+					callback_active_underflow = true;
+				}
+				pthread_mutex_unlock(&g_cec_context.mutex);
+				if (callback_active_underflow) {
+					CEC_LOG_WARN("callback_active already 0 after tx poll callback; skipping decrement");
+				}
 			}
 			return HDMI_CEC_IO_SUCCESS;
 		}
