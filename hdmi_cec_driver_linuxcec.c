@@ -997,7 +997,9 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 
 	pthread_mutex_unlock(&g_cec_context.mutex);
 
-	/* Signal rx_thread to exit then reap it if it was created and we're not that thread. */
+	/* Signal rx_thread to exit then reap it if it was created and we're not that thread.
+	 * Even if closing from within rx_thread, signal the self-pipe so poll() wakes and
+	 * executes the deferred cleanup code. */
 	if (rx_thread_created && !close_from_rx_thread) {
 		char byte = 1;
 		if (rx_thread_was_running && pipe_wr >= 0) {
@@ -1010,6 +1012,11 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 		g_cec_context.rx_thread = (pthread_t)0;
 		pthread_mutex_unlock(&g_cec_context.mutex);
 	} else if (close_from_rx_thread) {
+		/* Signal self-pipe to wake up from poll() so deferred cleanup executes. */
+		if (pipe_wr >= 0) {
+			char byte = 1;
+			(void)write(pipe_wr, &byte, 1);
+		}
 		CEC_LOG_INFO("HdmiCecClose invoked from rx_thread; deferring FD cleanup to thread exit");
 	}
 
@@ -1594,9 +1601,30 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
 	if (tx_ret < 0 && errno == EINVAL) {
 		if (len == 1) {
-			/* Preserve poll behavior symmetry with HdmiCecTx. */
+			/* Preserve poll behavior symmetry with HdmiCecTx: poll EINVAL means
+			 * not-acknowledged (listener could not be found or did not respond).
+			 * Synthesize tx_callback completion to maintain async API contract:
+			 * callers must be notified of result (they cannot infer from return value). */
 			cec_log_poll_einval_rate_limited_locked(msg.msg[0]);
+
+			HdmiCecTxCallback_t tx_callback = g_cec_context.tx_callback;
+			void *tx_callback_data = g_cec_context.tx_callback_data;
+			int callback_handle = g_cec_context.handle;
+			if (tx_callback != NULL) {
+				g_cec_context.callback_active++;
+			}
 			pthread_mutex_unlock(&g_cec_context.mutex);
+
+			if (tx_callback != NULL) {
+				tx_callback(callback_handle, tx_callback_data, HDMI_CEC_IO_SENT_BUT_NOT_ACKD);
+				pthread_mutex_lock(&g_cec_context.mutex);
+				if (g_cec_context.callback_active > 0) {
+					g_cec_context.callback_active--;
+				} else {
+					CEC_LOG_WARN("callback_active already 0 after tx poll callback");
+				}
+				pthread_mutex_unlock(&g_cec_context.mutex);
+			}
 			return HDMI_CEC_IO_SUCCESS;
 		}
 		/* Adapter state may have changed (mode/logical address). Recover then retry once. */
