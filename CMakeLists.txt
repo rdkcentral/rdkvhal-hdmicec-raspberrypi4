@@ -4,11 +4,28 @@ cmake_minimum_required(VERSION 3.10)
 # RCECHal version
 project(RCECHal VERSION 1.4.0 LANGUAGES C)
 
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 set(LIBNAME RCECHal)
 set(DEFAULT_BUILD_TYPE "Release")
 
-message(STATUS "Building with USERLAND-based CEC implementation")
-set(SRCS hdmi_cec_driver_userland.c)
+message(STATUS "Building with Linux CEC subsystem-based implementation")
+set(SRCS hdmi_cec_driver_linuxcec.c)
+
+# Full CEC device node path: /dev/cec0 = HDMI0 (default), /dev/cec1 = HDMI1
+set(CEC_DEV_NODE "/dev/cec0" CACHE STRING "CEC device node path (e.g. /dev/cec0 for HDMI0, /dev/cec1 for HDMI1)")
+message(STATUS "CEC device node: ${CEC_DEV_NODE}")
+
+# CEC identity/profile defaults; override for other platforms/devices.
+# NOTE: 0x00BC44 is the Raspberry Pi/Broadcom-specific default OUI used by this repo.
+# Override CEC_VENDOR_ID for non-RPi/non-Broadcom products.
+set(CEC_VENDOR_ID "0x00BC44" CACHE STRING "CEC vendor ID (24-bit hex, e.g. 0x0019FB)")
+set(CEC_PRIMARY_DEVICE_TYPE "CEC_OP_PRIM_DEVTYPE_TUNER" CACHE STRING "Primary CEC device type macro")
+set(CEC_LOG_ADDR_TYPE "CEC_LOG_ADDR_TYPE_TUNER" CACHE STRING "CEC logical address type macro")
+set(CEC_ALL_DEVICE_TYPE "CEC_OP_ALL_DEVTYPE_TUNER" CACHE STRING "CEC all-device type macro")
+message(STATUS "CEC vendor id: ${CEC_VENDOR_ID}")
+message(STATUS "CEC profile: primary=${CEC_PRIMARY_DEVICE_TYPE}, log_addr=${CEC_LOG_ADDR_TYPE}, all=${CEC_ALL_DEVICE_TYPE}")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
@@ -17,6 +34,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 # Get git commit SHA
 execute_process(
@@ -44,12 +62,6 @@ if(NOT HDMI_CEC_INCLUDE_DIR)
     set(HDMI_CEC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../rdk-halif-hdmi_cec/include)
 endif()
 
-# Configurable include directory for VMCS host Linux headers
-set(VMCS_HOST_INCLUDE_DIR "/usr/include/interface/vmcs_host/linux" CACHE PATH "Path to VMCS host Linux headers")
-if(NOT EXISTS "${VMCS_HOST_INCLUDE_DIR}")
-    message(WARNING "VMCS host include directory '${VMCS_HOST_INCLUDE_DIR}' does not exist. Adjust VMCS_HOST_INCLUDE_DIR if needed.")
-endif()
-
 add_library(${LIBNAME} SHARED ${SRCS})
 
 set_target_properties(${LIBNAME} PROPERTIES
@@ -58,12 +70,16 @@ set_target_properties(${LIBNAME} PROPERTIES
 )
 
 target_include_directories(${LIBNAME} PRIVATE ${HDMI_CEC_INCLUDE_DIR})
-target_include_directories(${LIBNAME} PRIVATE ${VMCS_HOST_INCLUDE_DIR})
-target_link_libraries(${LIBNAME} PRIVATE vchostif vchiq_arm vcos pthread)
+target_link_libraries(${LIBNAME} PRIVATE Threads::Threads)
 
 target_compile_definitions(${LIBNAME} PRIVATE
     HAL_VERSION="${PROJECT_VERSION}"
     GIT_COMMIT_SHA="${GIT_COMMIT_SHA}"
+    CEC_DEV_NODE="${CEC_DEV_NODE}"
+    CEC_VENDOR_ID=${CEC_VENDOR_ID}
+    CEC_PRIMARY_DEVICE_TYPE=${CEC_PRIMARY_DEVICE_TYPE}
+    CEC_LOG_ADDR_TYPE=${CEC_LOG_ADDR_TYPE}
+    CEC_ALL_DEVICE_TYPE=${CEC_ALL_DEVICE_TYPE}
 )
 
 add_custom_target(clean-all
@@ -77,7 +93,7 @@ install(TARGETS ${LIBNAME}
 # Define package configuration variables
 set(PACKAGE_NAME ${LIBNAME})
 set(PACKAGE_VERSION ${PROJECT_VERSION})
-set(PACKAGE_DESCRIPTION "RPI-4 HDMI CEC HAL Library")
+set(PACKAGE_DESCRIPTION "RPI-4 HDMI CEC HAL Library (Linux CEC subsystem)")
 set(PACKAGE_LIBS "-L${CMAKE_INSTALL_PREFIX}/lib -l${LIBNAME}")
 set(PACKAGE_CFLAGS "-I${CMAKE_INSTALL_PREFIX}/include")
 
