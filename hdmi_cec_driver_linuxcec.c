@@ -409,6 +409,7 @@ static cec_context_t g_cec_context = {
 
 /* Must be called with g_cec_context.mutex held. */
 static void cec_refresh_logical_address_locked(void);
+static void cec_release_logical_addresses_fd(int fd);
 
 /*
  * Receive thread: blocks on poll() multiplexed between the CEC device fd
@@ -545,6 +546,7 @@ static void *cec_rx_thread(void *arg)
 	if (ctx->deferred_cleanup) {
 		if (ctx->pipe_wr >= 0) close(ctx->pipe_wr);
 		if (ctx->pipe_rd >= 0) close(ctx->pipe_rd);
+		cec_release_logical_addresses_fd(ctx->fd);
 		if (ctx->fd >= 0)      close(ctx->fd);
 		if (ctx->lock_fd >= 0) close(ctx->lock_fd);
 
@@ -637,6 +639,19 @@ static void cec_refresh_logical_address_locked(void)
 	}
 	g_cec_context.logical_address = CEC_LOG_ADDR_UNREGISTERED;
 	g_cec_context.has_logical_address = false;
+}
+
+static void cec_release_logical_addresses_fd(int fd)
+{
+	if (fd < 0) {
+		return;
+	}
+
+	struct cec_log_addrs clear_addrs;
+	memset(&clear_addrs, 0, sizeof(clear_addrs));
+	if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &clear_addrs) < 0) {
+		CEC_LOG_WARN("CEC_ADAP_S_LOG_ADDRS(clear) failed during close: %s", strerror(errno));
+	}
 }
 
 /* Must be called with g_cec_context.mutex held.
@@ -880,11 +895,31 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 
 	/* This ioctl blocks until the logical address claiming process completes */
 	if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
-		CEC_LOG_ERROR("CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(errno));
-		close(fd);
-		close(lock_fd);
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
+		int set_log_addrs_errno = errno;
+		if (set_log_addrs_errno == EBUSY) {
+			/* Some kernels/adapter states report EBUSY when a logical address is
+			 * already active for this adapter. Reuse it instead of failing open. */
+			struct cec_log_addrs existing_log_addrs;
+			memset(&existing_log_addrs, 0, sizeof(existing_log_addrs));
+			if (ioctl(fd, CEC_ADAP_G_LOG_ADDRS, &existing_log_addrs) == 0 &&
+			    existing_log_addrs.num_log_addrs > 0 &&
+			    existing_log_addrs.log_addr[0] != CEC_LOG_ADDR_INVALID) {
+				CEC_LOG_WARN("CEC_ADAP_S_LOG_ADDRS busy; reusing existing logical address %d",
+				             existing_log_addrs.log_addr[0]);
+			} else {
+				CEC_LOG_ERROR("CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(set_log_addrs_errno));
+				close(fd);
+				close(lock_fd);
+				pthread_mutex_unlock(&g_cec_context.mutex);
+				return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
+			}
+		} else {
+			CEC_LOG_ERROR("CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(set_log_addrs_errno));
+			close(fd);
+			close(lock_fd);
+			pthread_mutex_unlock(&g_cec_context.mutex);
+			return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
+		}
 	}
 
 	/* Read back the allocated logical address */
@@ -1122,6 +1157,7 @@ HDMI_CEC_STATUS HdmiCecClose(int handle)
 	pthread_mutex_lock(&g_cec_context.mutex);
 	close(g_cec_context.pipe_wr);
 	close(g_cec_context.pipe_rd);
+	cec_release_logical_addresses_fd(g_cec_context.fd);
 	close(g_cec_context.fd);
 	close(g_cec_context.lock_fd);
 	g_cec_context.fd      = -1;
@@ -1241,6 +1277,18 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int *physicalAddr
  */
 HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
 {
+	if (!g_cec_context.initialized) {
+		return HDMI_CEC_IO_NOT_OPENED;
+	}
+
+	if (handle == 0 || handle != g_cec_context.handle) {
+		return HDMI_CEC_IO_INVALID_HANDLE;
+	}
+
+	if (logicalAddresses < 0 || logicalAddresses > 0x0F) {
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
 	/* For source devices, this operation is not supported */
 	CEC_LOG_ERROR("HdmiCecAddLogicalAddress not supported for source devices");
 	return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
@@ -1278,6 +1326,18 @@ HDMI_CEC_STATUS HdmiCecAddLogicalAddress(int handle, int logicalAddresses)
  */
 HDMI_CEC_STATUS HdmiCecRemoveLogicalAddress(int handle, int logicalAddresses)
 {
+	if (!g_cec_context.initialized) {
+		return HDMI_CEC_IO_NOT_OPENED;
+	}
+
+	if (handle == 0 || handle != g_cec_context.handle) {
+		return HDMI_CEC_IO_INVALID_HANDLE;
+	}
+
+	if (logicalAddresses < 0 || logicalAddresses > 0x0F) {
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
+	}
+
 	/* For source devices, this operation is not supported */
 	CEC_LOG_ERROR("HdmiCecRemoveLogicalAddress not supported for source devices");
 	return HDMI_CEC_IO_OPERATION_NOT_SUPPORTED;
@@ -1563,6 +1623,10 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		*result = HDMI_CEC_IO_SENT_AND_ACKD;
 	} else if (msg.tx_status & CEC_TX_STATUS_NACK) {
 		*result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
+	} else if (len == 1) {
+		/* Some adapters may complete poll transmit without setting explicit
+		 * tx_status bits. Preserve poll semantics as not-acknowledged. */
+		*result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
 	} else {
 		*result = HDMI_CEC_IO_SENT_FAILED;
 	}
@@ -1817,6 +1881,7 @@ static void __attribute__((destructor)) cec_driver_term(void)
 
 		if (g_cec_context.pipe_wr >= 0) close(g_cec_context.pipe_wr);
 		if (g_cec_context.pipe_rd >= 0) close(g_cec_context.pipe_rd);
+		cec_release_logical_addresses_fd(g_cec_context.fd);
 		if (g_cec_context.fd >= 0)      close(g_cec_context.fd);
 		if (g_cec_context.lock_fd >= 0) close(g_cec_context.lock_fd);
 		g_cec_context.fd      = -1;
