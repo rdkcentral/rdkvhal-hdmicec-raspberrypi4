@@ -352,7 +352,7 @@ static bool cec_is_allowed_device_path(const char *path)
 }
 
 /* CEC logical addresses are 4-bit values (0x00-0x0F). */
-static bool cecIsValidLogicalAddress(__u8 address)
+static bool cec_is_valid_logical_address(__u8 address)
 {
 	return address <= 0x0F;
 }
@@ -361,7 +361,7 @@ static bool cecIsValidLogicalAddress(__u8 address)
  * - 0xFFFF is always invalid.
  * - 0x0000 is only valid for TV/root-style profiles; STB/tuner builds reject it.
  */
-static bool cecIsValidPhysicalAddress(__u16 address)
+static bool cec_is_valid_physical_address(__u16 address)
 {
 	if (address == CEC_PHYS_ADDR_INVALID) {
 		return false;
@@ -642,7 +642,7 @@ static void cec_refresh_logical_address_locked(void)
 		return;
 	}
 
-	if (la.num_log_addrs > 0 && cecIsValidLogicalAddress(la.log_addr[0])) {
+	if (la.num_log_addrs > 0 && cec_is_valid_logical_address(la.log_addr[0])) {
 		int new_addr = (int)la.log_addr[0];
 		if (new_addr != g_cec_context.logical_address) {
 			CEC_LOG_WARN("Logical address refreshed: %d -> %d",
@@ -935,7 +935,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	bool has_logical = false;
 	if (ioctl(fd, CEC_ADAP_G_LOG_ADDRS, &log_addrs) == 0 &&
 	    log_addrs.num_log_addrs > 0 &&
-	    cecIsValidLogicalAddress(log_addrs.log_addr[0])) {
+	    cec_is_valid_logical_address(log_addrs.log_addr[0])) {
 		logical_addr = (int)log_addrs.log_addr[0];
 		has_logical  = (logical_addr != CEC_LOG_ADDR_UNREGISTERED);
 		CEC_LOG_INFO("Allocated logical address: %d", logical_addr);
@@ -1245,7 +1245,7 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int *physicalAddr
 		g_cec_context.physical_address = phys_addr;
 	}
 
-	if (!cecIsValidPhysicalAddress(phys_addr)) {
+	if (!cec_is_valid_physical_address(phys_addr)) {
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_INVALID_OUTPUT;
 	}
