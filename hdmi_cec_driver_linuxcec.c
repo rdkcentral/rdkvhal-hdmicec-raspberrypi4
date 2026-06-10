@@ -351,6 +351,29 @@ static bool cec_is_allowed_device_path(const char *path)
 	return true;
 }
 
+/* CEC logical addresses are 4-bit values (0x00-0x0F). */
+static bool cec_is_valid_logical_address(__u8 address)
+{
+	return address <= 0x0F;
+}
+
+/* CEC physical addresses are profile-dependent:
+ * - 0xFFFF is always invalid.
+ * - 0x0000 is only valid for TV/root-style profiles; STB/tuner builds reject it.
+ */
+static bool cec_is_valid_physical_address(__u16 address)
+{
+	if (address == CEC_PHYS_ADDR_INVALID) {
+		return false;
+	}
+
+	if (CEC_PRIMARY_DEVICE_TYPE == CEC_OP_PRIM_DEVTYPE_TV) {
+		return true;
+	}
+
+	return address != 0x0000;
+}
+
 static void trace_hexdump(const uint8_t *buf, size_t len)
 {
 	if (buf == NULL || len == 0 || g_log_level < CEC_LOG_LEVEL_TRACE)
@@ -619,7 +642,7 @@ static void cec_refresh_logical_address_locked(void)
 		return;
 	}
 
-	if (la.num_log_addrs > 0 && la.log_addr[0] != CEC_LOG_ADDR_INVALID) {
+	if (la.num_log_addrs > 0 && cec_is_valid_logical_address(la.log_addr[0])) {
 		int new_addr = (int)la.log_addr[0];
 		if (new_addr != g_cec_context.logical_address) {
 			CEC_LOG_WARN("Logical address refreshed: %d -> %d",
@@ -747,7 +770,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 {
 	if (handle == NULL) {
 		CEC_LOG_ERROR("Invalid argument: handle is NULL");
-		return HDMI_CEC_IO_INVALID_HANDLE;
+		return HDMI_CEC_IO_INVALID_ARGUMENT;
 	}
 
 	pthread_mutex_lock(&g_cec_context.mutex);
@@ -880,11 +903,31 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 
 	/* This ioctl blocks until the logical address claiming process completes */
 	if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
-		CEC_LOG_ERROR("CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(errno));
-		close(fd);
-		close(lock_fd);
-		pthread_mutex_unlock(&g_cec_context.mutex);
-		return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
+		/* Save errno before subsequent ioctls overwrite it */
+		int s_errno = errno;
+		if (s_errno == EBUSY) {
+			/* Kernel already has logical addresses assigned (previous session,
+			 * driver retained state, etc.).  Clear them first, then retry. */
+			CEC_LOG_WARN("CEC_ADAP_S_LOG_ADDRS busy; clearing existing addresses and retrying");
+			struct cec_log_addrs clear_addrs;
+			memset(&clear_addrs, 0, sizeof(clear_addrs));
+			clear_addrs.num_log_addrs = 0;
+			if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &clear_addrs) < 0) {
+				CEC_LOG_WARN("Clear CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(errno));
+			}
+			/* Retry the original claim */
+			if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &log_addrs) < 0) {
+				int retry_errno = errno;
+				CEC_LOG_WARN("CEC_ADAP_S_LOG_ADDRS retry failed: %s", strerror(retry_errno));
+				/* Fall through: try to read back whatever the kernel has */
+			}
+		} else {
+			CEC_LOG_ERROR("CEC_ADAP_S_LOG_ADDRS failed: %s", strerror(s_errno));
+			close(fd);
+			close(lock_fd);
+			pthread_mutex_unlock(&g_cec_context.mutex);
+			return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
+		}
 	}
 
 	/* Read back the allocated logical address */
@@ -892,7 +935,7 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 	bool has_logical = false;
 	if (ioctl(fd, CEC_ADAP_G_LOG_ADDRS, &log_addrs) == 0 &&
 	    log_addrs.num_log_addrs > 0 &&
-	    log_addrs.log_addr[0] != CEC_LOG_ADDR_INVALID) {
+	    cec_is_valid_logical_address(log_addrs.log_addr[0])) {
 		logical_addr = (int)log_addrs.log_addr[0];
 		has_logical  = (logical_addr != CEC_LOG_ADDR_UNREGISTERED);
 		CEC_LOG_INFO("Allocated logical address: %d", logical_addr);
@@ -1202,7 +1245,7 @@ HDMI_CEC_STATUS HdmiCecGetPhysicalAddress(int handle, unsigned int *physicalAddr
 		g_cec_context.physical_address = phys_addr;
 	}
 
-	if (phys_addr == CEC_PHYS_ADDR_INVALID) {
+	if (!cec_is_valid_physical_address(phys_addr)) {
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_INVALID_OUTPUT;
 	}
