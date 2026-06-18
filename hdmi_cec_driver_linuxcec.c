@@ -511,9 +511,19 @@ static void *cec_rx_thread(void *arg)
 			pthread_mutex_unlock(&ctx->mutex);
 
 			if (should_call) {
-				int result = (msg.tx_status & CEC_TX_STATUS_OK)   ? HDMI_CEC_IO_SENT_AND_ACKD :
-				             (msg.tx_status & CEC_TX_STATUS_NACK) ? HDMI_CEC_IO_SENT_BUT_NOT_ACKD :
-				             HDMI_CEC_IO_SENT_FAILED;
+				/* For broadcast messages (dest 0xF), CEC_TX_STATUS_OK means
+				 * "sent without error" but no device individually ACKed.
+				 * Map to SENT_BUT_NOT_ACKD*/
+				__u8 tx_dest = (msg.len > 0) ? (msg.msg[0] & 0x0F) : 0x00;
+				int result;
+				if (msg.tx_status & CEC_TX_STATUS_OK) {
+					result = (tx_dest == 0x0F) ? HDMI_CEC_IO_SENT_BUT_NOT_ACKD
+					                           : HDMI_CEC_IO_SENT_AND_ACKD;
+				} else if (msg.tx_status & CEC_TX_STATUS_NACK) {
+					result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
+				} else {
+					result = HDMI_CEC_IO_SENT_FAILED;
+				}
 				tx_cb(cb_handle, tx_cb_data, result);
 
 				bool callback_active_underflow = false;
@@ -766,6 +776,38 @@ static void cec_recover_tx_state_locked(void)
 	}
 }
 
+/* Must be called with g_cec_context.mutex held.
+ * Performs a best-effort preflight before transmit:
+ *  - ensure initiator mode is enabled
+ *  - refresh/recover logical address state if needed */
+static bool cec_prepare_tx_locked(void)
+{
+	__u32 mode = 0;
+	if (ioctl(g_cec_context.fd, CEC_G_MODE, &mode) == 0) {
+		if ((mode & CEC_MODE_INITIATOR) == 0) {
+			CEC_LOG_WARN("TX preflight: initiator mode not set (mode=0x%x), re-applying", mode);
+			mode = CEC_MODE_INITIATOR | CEC_MODE_EXCL_FOLLOWER_PASSTHROUGH;
+			if (ioctl(g_cec_context.fd, CEC_S_MODE, &mode) < 0) {
+				CEC_LOG_WARN("TX preflight: CEC_S_MODE failed: %s", strerror(errno));
+				return false;
+			}
+		}
+	} else {
+		CEC_LOG_WARN("TX preflight: CEC_G_MODE failed: %s", strerror(errno));
+	}
+
+	cec_refresh_logical_address_locked();
+	if (!g_cec_context.has_logical_address) {
+		CEC_LOG_WARN("TX preflight: no logical address, attempting recovery");
+		cec_recover_tx_state_locked();
+		if (!g_cec_context.has_logical_address) {
+			CEC_LOG_WARN("TX preflight: still no logical address after recovery; proceeding as Unregistered");
+		}
+	}
+
+	return true;
+}
+
 HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 {
 	if (handle == NULL) {
@@ -941,6 +983,16 @@ HDMI_CEC_STATUS HdmiCecOpen(int *handle)
 		CEC_LOG_INFO("Allocated logical address: %d", logical_addr);
 	} else {
 		CEC_LOG_DEBUG("No logical address allocated (operating as Unregistered)");
+	}
+
+	/* No logical address available for source device; no CEC sink connected. */
+	if (CEC_PRIMARY_DEVICE_TYPE != CEC_OP_PRIM_DEVTYPE_TV && !has_logical) {
+		CEC_LOG_ERROR("No logical address available (no CEC sink connected)");
+		*handle = cec_generate_handle();
+		close(fd);
+		close(lock_fd);
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_LOGICALADDRESS_UNAVAILABLE;
 	}
 
 	/* Create self-pipe for clean rx_thread shutdown */
@@ -1551,6 +1603,12 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 		return HDMI_CEC_IO_INVALID_HANDLE;
 	}
 
+	if (!cec_prepare_tx_locked()) {
+		*result = HDMI_CEC_IO_SENT_FAILED;
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_SENT_FAILED;
+	}
+
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
 	msg.timeout = CEC_TX_TIMEOUT_MS; /* block until ACK/NACK */
@@ -1603,11 +1661,36 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	}
 
 	if (msg.tx_status & CEC_TX_STATUS_OK) {
-		*result = HDMI_CEC_IO_SENT_AND_ACKD;
+		/* Broadcast (dest 0xF) is never ACKed individually; map OK to NOT_ACKD. */
+		if (destination == 0x0F) {
+			*result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
+		} else {
+			*result = HDMI_CEC_IO_SENT_AND_ACKD;
+		}
 	} else if (msg.tx_status & CEC_TX_STATUS_NACK) {
 		*result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
 	} else {
-		*result = HDMI_CEC_IO_SENT_FAILED;
+		__u8 tx_failure_mask = 0;
+#ifdef CEC_TX_STATUS_ARB_LOST
+		tx_failure_mask |= CEC_TX_STATUS_ARB_LOST;
+#endif
+#ifdef CEC_TX_STATUS_LOW_DRIVE
+		tx_failure_mask |= CEC_TX_STATUS_LOW_DRIVE;
+#endif
+#ifdef CEC_TX_STATUS_ERROR
+		tx_failure_mask |= CEC_TX_STATUS_ERROR;
+#endif
+#ifdef CEC_TX_STATUS_MAX_RETRIES
+		tx_failure_mask |= CEC_TX_STATUS_MAX_RETRIES;
+#endif
+
+		/* Treat explicit transmit failure bits as hard failure.
+		 * Only keep NOT_ACKD fallback for ambiguous statuses with no known error bits. */
+		if ((msg.tx_status & tx_failure_mask) != 0) {
+			*result = HDMI_CEC_IO_SENT_FAILED;
+		} else {
+			*result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
+		}
 	}
 
 	/* HdmiCecTx() is the blocking transmit path: completion for this call is
@@ -1675,6 +1758,11 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	if (handle == 0 || handle != g_cec_context.handle) {
 		pthread_mutex_unlock(&g_cec_context.mutex);
 		return HDMI_CEC_IO_INVALID_HANDLE;
+	}
+
+	if (!cec_prepare_tx_locked()) {
+		pthread_mutex_unlock(&g_cec_context.mutex);
+		return HDMI_CEC_IO_SENT_FAILED;
 	}
 
 	struct cec_msg msg;
