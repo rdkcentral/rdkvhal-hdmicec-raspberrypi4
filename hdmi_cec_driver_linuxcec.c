@@ -514,11 +514,15 @@ static void *cec_rx_thread(void *arg)
 				/* For broadcast messages (dest 0xF), CEC_TX_STATUS_OK means
 				 * "sent without error" but no device individually ACKed.
 				 * Map to SENT_BUT_NOT_ACKD*/
-				__u8 tx_dest = (msg.len > 0) ? (msg.msg[0] & 0x0F) : 0x00;
 				int result;
 				if (msg.tx_status & CEC_TX_STATUS_OK) {
-					result = (tx_dest == 0x0F) ? HDMI_CEC_IO_SENT_BUT_NOT_ACKD
-					                           : HDMI_CEC_IO_SENT_AND_ACKD;
+					if (msg.len == 0) {
+						result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
+					} else {
+						__u8 tx_dest = (msg.msg[0] & 0x0F);
+						result = (tx_dest == 0x0F) ? HDMI_CEC_IO_SENT_BUT_NOT_ACKD
+						                           : HDMI_CEC_IO_SENT_AND_ACKD;
+					}
 				} else if (msg.tx_status & CEC_TX_STATUS_NACK) {
 					result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
 				} else {
