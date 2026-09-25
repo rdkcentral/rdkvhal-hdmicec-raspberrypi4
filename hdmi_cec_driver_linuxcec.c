@@ -107,8 +107,6 @@
 #define CEC_LOG_DEBUG(fmt, ...) CEC_LOG(CEC_LOG_LEVEL_DEBUG, "RPICECHAL: " fmt, ##__VA_ARGS__)
 #define CEC_LOG_TRACE(fmt, ...) CEC_LOG(CEC_LOG_LEVEL_TRACE, "RPICECHAL: " fmt, ##__VA_ARGS__)
 
-#define CEC_POLL_EINVAL_LOG_INTERVAL 100
-
 /* Timing constants for cleanup and callback synchronization */
 #define CEC_CALLBACK_WAIT_MS              10
 #define CEC_CALLBACK_WAIT_US              (CEC_CALLBACK_WAIT_MS * 1000)
@@ -147,7 +145,6 @@ static pthread_key_t g_callback_tls_key;
 static pthread_once_t g_callback_tls_once = PTHREAD_ONCE_INIT;
 static int g_callback_tls_init_status = EINVAL;
 static int g_log_level = CEC_LOG_LEVEL_WARN;
-static unsigned int g_poll_einval_suppressed = 0;
 
 static void cec_callback_tls_init_impl(void)
 {
@@ -711,23 +708,6 @@ static void cec_log_tx_diagnostics_locked(const struct cec_msg *msg, int len)
 		             (unsigned int)caps.available_log_addrs);
 	} else {
 		CEC_LOG_WARN("TX diag: CEC_ADAP_G_CAPS failed: %s", strerror(errno));
-	}
-}
-
-/* Must be called with g_cec_context.mutex held. */
-static void cec_log_poll_einval_rate_limited_locked(__u8 header)
-{
-	g_poll_einval_suppressed++;
-	if (g_poll_einval_suppressed == 1) {
-		CEC_LOG_WARN("Poll transmit rejected with EINVAL (hdr=0x%02x); treating as NACK",
-		             header);
-		return;
-	}
-
-	if (g_poll_einval_suppressed >= CEC_POLL_EINVAL_LOG_INTERVAL) {
-		CEC_LOG_WARN("Poll transmit EINVAL repeated %u times (latest hdr=0x%02x); continuing as NACK",
-		             g_poll_einval_suppressed, header);
-		g_poll_einval_suppressed = 0;
 	}
 }
 
@@ -1615,7 +1595,9 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 
 	struct cec_msg msg;
 	memset(&msg, 0, sizeof(msg));
-	msg.timeout = CEC_TX_TIMEOUT_MS; /* block until ACK/NACK */
+	/* Header-only CEC polls (len==1) must not specify a timeout.
+	 * For normal CEC messages, wait for the transmission result. */
+	msg.timeout = (len > 1) ? CEC_TX_TIMEOUT_MS : 0;
 	/* Keep userland compatibility: ignore caller-provided source nibble and
 	 * transmit from the adapter's currently allocated logical address.
 	 * RDK HAL byte order: (source << 4) | destination */
@@ -1633,14 +1615,6 @@ HDMI_CEC_STATUS HdmiCecTx(int handle, const unsigned char *buf, int len, int *re
 	 * g_cec_context.fd while this ioctl is in progress. */
 	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
 	if (tx_ret < 0 && errno == EINVAL) {
-		if (len == 1) {
-			/* Some Linux CEC drivers reject header-only poll with EINVAL even
-			 * in otherwise valid adapter state. Keep userland-compatible behavior. */
-			cec_log_poll_einval_rate_limited_locked(msg.msg[0]);
-			*result = HDMI_CEC_IO_SENT_BUT_NOT_ACKD;
-			pthread_mutex_unlock(&g_cec_context.mutex);
-			return HDMI_CEC_IO_SUCCESS;
-		}
 		/* Adapter state may have changed (mode/logical address). Recover then retry once. */
 		cec_log_tx_diagnostics_locked(&msg, len);
 		CEC_LOG_WARN("CEC_TRANSMIT returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
@@ -1789,51 +1763,6 @@ HDMI_CEC_STATUS HdmiCecTxAsync(int handle, const unsigned char *buf, int len)
 	 * on g_cec_context.fd. */
 	int tx_ret = ioctl(g_cec_context.fd, CEC_TRANSMIT, &msg);
 	if (tx_ret < 0 && errno == EINVAL) {
-		if (len == 1) {
-			/* Preserve poll behavior symmetry with HdmiCecTx: poll EINVAL means
-			 * not-acknowledged (listener could not be found or did not respond).
-			 * Synthesize tx_callback completion to maintain async API contract:
-			 * callers must be notified of result (they cannot infer from return value).
-			 *
-			 * Account for this inline completion in callback_active so shutdown
-			 * can wait for in-flight callback execution from other threads.
-			 * Close re-entry from this same callback thread is handled by
-			 * cec_is_in_callback_context() bias in HdmiCecClose(). */
-			cec_log_poll_einval_rate_limited_locked(msg.msg[0]);
-
-			HdmiCecTxCallback_t tx_callback = NULL;
-			void *tx_callback_data = NULL;
-			int callback_handle = 0;
-			bool invoke_callback = false;
-			if (g_cec_context.running && !g_cec_context.closing &&
-			    g_cec_context.initialized && g_cec_context.tx_callback != NULL) {
-				tx_callback = g_cec_context.tx_callback;
-				tx_callback_data = g_cec_context.tx_callback_data;
-				callback_handle = g_cec_context.handle;
-				g_cec_context.callback_active++;
-				invoke_callback = true;
-			}
-			pthread_mutex_unlock(&g_cec_context.mutex);
-
-			if (invoke_callback) {
-				cec_set_in_callback_context(true);
-				tx_callback(callback_handle, tx_callback_data, HDMI_CEC_IO_SENT_BUT_NOT_ACKD);
-				cec_set_in_callback_context(false);
-
-				bool callback_active_underflow = false;
-				pthread_mutex_lock(&g_cec_context.mutex);
-				if (g_cec_context.callback_active > 0) {
-					g_cec_context.callback_active--;
-				} else {
-					callback_active_underflow = true;
-				}
-				pthread_mutex_unlock(&g_cec_context.mutex);
-				if (callback_active_underflow) {
-					CEC_LOG_WARN("callback_active already 0 after tx poll callback; skipping decrement");
-				}
-			}
-			return HDMI_CEC_IO_SUCCESS;
-		}
 		/* Adapter state may have changed (mode/logical address). Recover then retry once. */
 		cec_log_tx_diagnostics_locked(&msg, len);
 		CEC_LOG_WARN("CEC_TRANSMIT (async) returned EINVAL (hdr=0x%02x len=%d), attempting recovery",
